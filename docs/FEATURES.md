@@ -1,5 +1,7 @@
 # EduPilot feature list
 
+> This is the original first-review feature list. For current implementation status and safeguards, see [COMPLETE_FEATURE_SCOPE.md](COMPLETE_FEATURE_SCOPE.md).
+
 ## 1. Separate sign-in
 
 | Role | What the user sees |
@@ -7,7 +9,7 @@
 | Faculty | Faculty Dashboard and authorised class/lab management tools |
 | Student | Personal Dashboard showing only their own academic, attendance, and laboratory progress |
 
-The current sign-in is a first-review prototype. The final version will authenticate users from approved local accounts and enforce role-based access.
+At the time of this first-review snapshot, sign-in was still a prototype. The current app authenticates local accounts and applies faculty/student role checks; use the current scope document above for the full status audit.
 
 ## 2. Faculty features
 
@@ -32,6 +34,10 @@ The current sign-in is a first-review prototype. The final version will authenti
 | Lab Assistant | Today's experiment, assigned system, Open VS Code, Lab Manual, mark completion | Interactive UI |
 | AI Study Assistant | Answers sourced from approved course notes and lab manuals | Planned after knowledge base |
 | My Reports | Personal attendance, academic, and lab summary | UI prototype |
+
+## Current implementation note
+
+The project has since moved beyond this first-review feature list. Current local authentication, completed database workflows, optional offline dictation, private per-account voice notes, and implementation limitations are documented in [COMPLETE_FEATURE_SCOPE.md](COMPLETE_FEATURE_SCOPE.md).
 
 ## 4. Important implementation rules
 

@@ -12,9 +12,27 @@ if %errorlevel% neq 0 (
     pause
     exit /b 1
 )
+python -c "import sys; raise SystemExit(sys.version_info < (3, 10))" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [ERROR] EduPilot requires Python 3.10 or newer.
+    pause
+    exit /b 1
+)
 
 echo [1/4] Creating Python Virtual Environment (venv)...
-if not exist "venv" (
+if exist "venv\Scripts\python.exe" (
+    call "venv\Scripts\python.exe" --version >nul 2>&1
+    if errorlevel 1 (
+        echo The existing virtual environment points to a missing Python installation.
+        echo Removing the broken generated environment so it can be rebuilt...
+        rmdir /s /q "venv"
+    )
+)
+if exist "venv" if not exist "venv\Scripts\python.exe" (
+    echo Removing an incomplete generated virtual environment...
+    rmdir /s /q "venv"
+)
+if not exist "venv\Scripts\python.exe" (
     python -m venv venv
     if %errorlevel% neq 0 (
         echo [ERROR] Failed to create virtual environment.
@@ -23,7 +41,7 @@ if not exist "venv" (
     )
     echo Virtual environment created successfully.
 ) else (
-    echo Virtual environment 'venv' already exists.
+    echo Virtual environment 'venv' is ready.
 )
 
 echo.

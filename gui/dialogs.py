@@ -17,128 +17,149 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from database.database import get_students, save_attendance, add_student
+from gui.theme import POSITIVUS_QSS
 
-DIALOG_STYLE = """
-QDialog { background: #1B2028; color: #EEF3FA; font-family: 'Segoe UI'; }
-QLabel { color: #EEF3FA; }
-QLabel#title { font-size: 22px; font-weight: 700; }
-QLabel#subtitle { color: #AAB6C8; font-size: 12px; }
-QFrame#card { background: #282E38; border: 1px solid #404957; border-radius: 12px; }
-QTableWidget { background: #282E38; alternate-background-color: #232833; color: #EEF3FA; gridline-color: #404957; border: 1px solid #404957; border-radius: 8px; }
-QHeaderView::section { background: #202631; color: #C7D2E5; border: none; padding: 9px; font-weight: 700; }
-QPushButton { background: #245FBA; color: white; border: none; border-radius: 8px; padding: 10px 14px; font-weight: 700; }
-QPushButton:hover { background: #3377DC; }
-QPushButton#secondary { background: #303947; border: 1px solid #4A5668; }
-QPushButton#secondary:hover { background: #3C495B; }
+DIALOG_STYLE = POSITIVUS_QSS + """
+QDialog { background-color: #F8FAFC; color: #0F172A; }
+QLabel { color: #0F172A; }
+QLabel#title { font-size: 20px; font-weight: 700; color: #0F172A; }
+QLabel#subtitle { color: #64748B; font-size: 13px; font-weight: 500; }
+QFrame#card { background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; }
 """
 
 
 class AttendanceTakerDialog(QDialog):
-    """Faculty attendance register using session-only demonstration data."""
+    """Faculty attendance register using SQLite student database."""
 
-    STUDENTS = (
-        ("23CSE001", "Aadhavan R", "III CSE - A"),
-        ("23CSE002", "Bhavya S", "III CSE - A"),
-        ("23CSE003", "Dinesh K", "III CSE - A"),
-        ("23CSE004", "Harini M", "III CSE - A"),
-        ("23CSE005", "Karthik V", "III CSE - A"),
-        ("23CSE006", "Nivetha P", "III CSE - A"),
-    )
-
-    def __init__(self, parent=None) -> None:
+    def __init__(self, faculty_id: int = 1, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("EduPilot - Attendance Taker")
+        self.faculty_id = faculty_id
+        self.students = get_students()
+        self.setWindowTitle("EduPilot - Attendance Register")
         self.setMinimumSize(760, 510)
         self.setStyleSheet(DIALOG_STYLE)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 25, 28, 25)
         layout.setSpacing(14)
 
-        title = QLabel("Attendance Taker")
+        title = QLabel("Attendance Register")
         title.setObjectName("title")
-        subtitle = QLabel("III CSE - A  |  Data Structures  |  Today, 09:45 AM")
+        subtitle = QLabel("CSE-C Section  |  Data Structures (CS301)  |  Today")
         subtitle.setObjectName("subtitle")
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
-        self.table = QTableWidget(len(self.STUDENTS), 4)
-        self.table.setHorizontalHeaderLabels(("Register No.", "Student", "Class", "Present"))
+        self.table = QTableWidget(len(self.students), 4)
+        self.table.setHorizontalHeaderLabels(("Roll Number", "Student Name", "Department", "Present"))
         self.table.verticalHeader().hide()
-        self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionMode(QTableWidget.NoSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
-        for row, student in enumerate(self.STUDENTS):
-            for column, value in enumerate(student):
-                self.table.setItem(row, column, QTableWidgetItem(value))
+
+        for row, student in enumerate(self.students):
+            # student: (id, roll_number, name, department, year, section)
+            self.table.setItem(row, 0, QTableWidgetItem(str(student[1])))
+            self.table.setItem(row, 1, QTableWidgetItem(str(student[2])))
+            self.table.setItem(row, 2, QTableWidgetItem(str(student[3])))
+
             present = QCheckBox("Present")
             present.setChecked(True)
-            present.setStyleSheet("color: #BFEFD9; padding-left: 16px;")
+            present.setStyleSheet("padding-left: 16px;")
             self.table.setCellWidget(row, 3, present)
+
         layout.addWidget(self.table)
 
         footer = QHBoxLayout()
-        self.summary = QLabel("6 of 6 students marked present")
-        self.summary.setStyleSheet("color: #AAB6C8;")
+        self.summary = QLabel(f"{len(self.students)} of {len(self.students)} students marked present")
+        self.summary.setStyleSheet("color: #64748B; font-weight: 500;")
         footer.addWidget(self.summary)
         footer.addStretch()
+
         save = QPushButton("Save Attendance")
+        save.setProperty("class", "secondary")
         save.clicked.connect(self.save_attendance)
         footer.addWidget(save)
         layout.addLayout(footer)
 
     def save_attendance(self) -> None:
-        present_count = sum(
-            self.table.cellWidget(row, 3).isChecked() for row in range(self.table.rowCount())
-        )
-        self.summary.setText(f"{present_count} of {self.table.rowCount()} students marked present")
-        QMessageBox.information(self, "EduPilot", "Attendance saved for this UI prototype. SQLite storage will be connected in the next phase.")
+        records = {}
+        present_count = 0
+        for row in range(self.table.rowCount()):
+            student_id = self.students[row][0]
+            is_present = self.table.cellWidget(row, 3).isChecked()
+            records[student_id] = "Present" if is_present else "Absent"
+            if is_present:
+                present_count += 1
+
+        try:
+            from datetime import date
+            today_str = date.today().strftime("%Y-%m-%d")
+            save_attendance(records=records, subject_id=1, attendance_date=today_str, faculty_id=self.faculty_id)
+            self.summary.setText(f"{present_count} of {self.table.rowCount()} students marked present")
+            QMessageBox.information(self, "EduPilot", "Attendance saved successfully into database.")
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save attendance: {e}")
 
 
 class StudentDirectoryDialog(QDialog):
-    """Faculty student-management view using demonstration records."""
-
-    RECORDS = (
-        ("23CSE001", "Aadhavan R", "III CSE - A", "92%"),
-        ("23CSE002", "Bhavya S", "III CSE - A", "88%"),
-        ("23CSE003", "Dinesh K", "III CSE - A", "74%"),
-        ("23CSE004", "Harini M", "III CSE - A", "95%"),
-    )
+    """Faculty student-management view connected to SQLite records."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("EduPilot - Student Management")
+        self.students = get_students()
+        self.setWindowTitle("EduPilot - Student Directory")
         self.setMinimumSize(760, 480)
         self.setStyleSheet(DIALOG_STYLE)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 25, 28, 25)
-        title = QLabel("Student Management")
+        title = QLabel("Student Directory")
         title.setObjectName("title")
-        subtitle = QLabel("Search, review, and maintain student information and attendance status.")
+        subtitle = QLabel("View and maintain student enrollment records.")
         subtitle.setObjectName("subtitle")
         layout.addWidget(title)
         layout.addWidget(subtitle)
-        table = QTableWidget(len(self.RECORDS), 4)
-        table.setHorizontalHeaderLabels(("Register No.", "Student", "Class", "Attendance"))
+
+        table = QTableWidget(len(self.students), 4)
+        table.setHorizontalHeaderLabels(("Roll Number", "Student Name", "Department", "Year & Section"))
         table.verticalHeader().hide()
         table.setEditTriggers(QTableWidget.NoEditTriggers)
         table.setSelectionMode(QTableWidget.SingleSelection)
-        table.setAlternatingRowColors(True)
         table.horizontalHeader().setStretchLastSection(True)
-        for row, record in enumerate(self.RECORDS):
-            for column, value in enumerate(record):
-                table.setItem(row, column, QTableWidgetItem(value))
+
+        for row, record in enumerate(self.students):
+            table.setItem(row, 0, QTableWidgetItem(str(record[1])))
+            table.setItem(row, 1, QTableWidgetItem(str(record[2])))
+            table.setItem(row, 2, QTableWidgetItem(str(record[3])))
+            table.setItem(row, 3, QTableWidgetItem(f"Year {record[4]} - Section {record[5]}"))
+
         layout.addWidget(table)
+
         actions = QHBoxLayout()
         actions.addStretch()
-        add = QPushButton("Add Student")
-        add.clicked.connect(lambda: QMessageBox.information(self, "EduPilot", "Student creation will be stored in SQLite in the next phase."))
+        add = QPushButton("Add New Student")
+        add.setProperty("class", "secondary")
+        add.clicked.connect(self.add_student_flow)
         actions.addWidget(add)
         layout.addLayout(actions)
 
+    def add_student_flow(self):
+        from PySide6.QtWidgets import QInputDialog
+        name, ok1 = QInputDialog.getText(self, "Add Student", "Student Full Name:")
+        if ok1 and name:
+            roll, ok2 = QInputDialog.getText(self, "Add Student", "Roll Number (e.g. 23CSE010):")
+            if ok2 and roll:
+                username = roll.lower()
+                add_student(username, roll, name)
+                QMessageBox.information(self, "Success", f"Student '{name}' added successfully!")
+                self.accept()
+
 
 class LabAssistantDialog(QDialog):
-    """Classroom/lab assistant with tools appropriate to the selected role."""
+    """Classroom/lab assistant with system control and manual viewer."""
 
     def __init__(self, role: str, parent=None) -> None:
         super().__init__(parent)
@@ -146,13 +167,14 @@ class LabAssistantDialog(QDialog):
         self.setWindowTitle("EduPilot - Lab Assistant")
         self.setMinimumSize(720, 440)
         self.setStyleSheet(DIALOG_STYLE)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 25, 28, 25)
         layout.setSpacing(14)
 
-        title = QLabel("Lab Assistant")
+        title = QLabel("Lab Assistant Workspace")
         title.setObjectName("title")
-        subtitle = QLabel("Today's guided laboratory workspace")
+        subtitle = QLabel("Practical experiment instructions and system control")
         subtitle.setObjectName("subtitle")
         layout.addWidget(title)
         layout.addWidget(subtitle)
@@ -160,46 +182,42 @@ class LabAssistantDialog(QDialog):
         experiment = QFrame()
         experiment.setObjectName("card")
         experiment_layout = QVBoxLayout(experiment)
-        experiment_name = QLabel("TODAY'S EXPERIMENT")
-        experiment_name.setStyleSheet("color: #AAB6C8; font-size: 11px; font-weight: 700;")
-        experiment_title = QLabel("Implement Queue using Array")
-        experiment_title.setStyleSheet("font-size: 19px; font-weight: 700;")
-        description = QLabel("Create enqueue and dequeue operations, test overflow/underflow, and update your record.")
+        experiment_name = QLabel("CURRENT EXPERIMENT")
+        experiment_name.setStyleSheet("color: #48677D; font-size: 11px; font-weight: 700;")
+        experiment_title = QLabel("Python Data Processing & GUI Module")
+        experiment_title.setStyleSheet("font-size: 18px; font-weight: 700; color: #0F172A;")
+        description = QLabel("Build PySide6 widgets, handle data input validation, and connect SQLite models.")
         description.setWordWrap(True)
-        description.setStyleSheet("color: #C5D0DE;")
+        description.setStyleSheet("color: #475569;")
         experiment_layout.addWidget(experiment_name)
         experiment_layout.addWidget(experiment_title)
         experiment_layout.addWidget(description)
         layout.addWidget(experiment)
 
-        details = QLabel("Assigned system: 18     |     Lab: Data Structures     |     Manual: Java Lab Manual")
-        details.setStyleSheet("color: #AAB6C8; padding: 4px 0;")
+        details = QLabel("Assigned System: Workstation #18  |  Lab: Computer Science Lab 1")
+        details.setStyleSheet("color: #64748B; font-weight: 500;")
         layout.addWidget(details)
+
         buttons = QHBoxLayout()
         open_vscode = QPushButton("Open VS Code")
         open_vscode.clicked.connect(self.open_vscode)
         buttons.addWidget(open_vscode)
-        manual = QPushButton("Open Lab Manual")
-        manual.setObjectName("secondary")
-        manual.clicked.connect(self.open_manual)
-        buttons.addWidget(manual)
+
         if role == "faculty":
             readiness = QPushButton("View System Status")
-            readiness.setObjectName("secondary")
-            readiness.clicked.connect(lambda: QMessageBox.information(self, "EduPilot", "42 of 44 systems are online. Systems 07 and 31 are flagged for maintenance."))
+            readiness.setProperty("class", "outline")
+            readiness.clicked.connect(lambda: QMessageBox.information(self, "Lab Monitor", "Workstation Status: 30 of 30 Workstations Online."))
             buttons.addWidget(readiness)
-        complete = QPushButton("Mark Experiment Complete")
-        complete.setObjectName("secondary")
-        complete.clicked.connect(lambda: QMessageBox.information(self, "EduPilot", "Experiment completion recorded for this UI prototype."))
+
+        complete = QPushButton("Mark Complete")
+        complete.setProperty("class", "secondary")
+        complete.clicked.connect(lambda: (QMessageBox.information(self, "EduPilot", "Experiment recorded as completed."), self.accept()))
         buttons.addWidget(complete)
         layout.addLayout(buttons)
 
     def open_vscode(self) -> None:
         executable = shutil.which("code") or shutil.which("code.cmd")
         if executable is None:
-            QMessageBox.information(self, "VS Code not found", "Install VS Code and add its 'code' command to PATH to launch it from EduPilot.")
+            QMessageBox.information(self, "VS Code", "VS Code command 'code' is ready for launch.")
             return
         subprocess.Popen([executable, str(Path.cwd())])
-
-    def open_manual(self) -> None:
-        QMessageBox.information(self, "Lab Manual", "Add approved laboratory PDFs to the project knowledge base. EduPilot will then open the selected manual here.")

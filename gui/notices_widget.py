@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
     QComboBox, QMessageBox
 )
 from PySide6.QtCore import Qt
+from datetime import date
 from database.database import (
     get_announcements,
     add_announcement,
@@ -11,6 +12,7 @@ from database.database import (
     add_reminder,
     toggle_reminder_completed
 )
+from gui.theme import POSITIVUS_QSS, create_section_header, configure_wrapped_list
 
 class NoticesAndRemindersWidget(QWidget):
     """
@@ -23,9 +25,17 @@ class NoticesAndRemindersWidget(QWidget):
         self.init_ui()
 
     def init_ui(self):
-        main_layout = QHBoxLayout(self)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(15)
+        self.setStyleSheet(POSITIVUS_QSS)
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(20, 20, 20, 20)
+        outer_layout.setSpacing(16)
+
+        header = create_section_header("Notices & Academic Reminders")
+        outer_layout.addWidget(header)
+
+        main_layout = QHBoxLayout()
+        main_layout.setSpacing(16)
 
         # Left Column: Announcements & Bulletins
         left_widget = QWidget()
@@ -33,39 +43,47 @@ class NoticesAndRemindersWidget(QWidget):
         left_layout.setContentsMargins(0, 0, 10, 0)
 
         ann_title = QLabel("Department Notices & Announcements")
-        ann_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #60A5FA;")
+        ann_title.setStyleSheet("font-size: 14px; font-weight: 700; color: #0F172A;")
         left_layout.addWidget(ann_title)
 
         self.list_announcements = QListWidget()
-        self.list_announcements.setStyleSheet("""
-            QListWidget { background-color: #1F2937; color: #E5E7EB; font-size: 13px; border-radius: 8px; padding: 10px; }
-            QListWidget::item { border-bottom: 1px solid #374151; padding: 8px; }
-        """)
+        configure_wrapped_list(self.list_announcements)
         left_layout.addWidget(self.list_announcements)
 
         if self.role == "faculty":
             post_frame = QFrame()
-            post_frame.setStyleSheet("background-color: #1E293B; border-radius: 8px; padding: 10px;")
+            post_frame.setObjectName("surfaceCard")
+            post_frame.setStyleSheet("""
+                QFrame#surfaceCard {
+                    background-color: #FFFFFF;
+                    border: 1px solid #E2E8F0;
+                    border-radius: 8px;
+                    padding: 14px;
+                }
+            """)
             pf = QVBoxLayout(post_frame)
 
             post_lbl = QLabel("Post New Announcement")
-            post_lbl.setStyleSheet("font-weight: bold; color: #34D399;")
+            post_lbl.setStyleSheet("font-weight: 700; font-size: 13px; color: #0F172A;")
             pf.addWidget(post_lbl)
 
             self.input_ann_title = QLineEdit()
             self.input_ann_title.setPlaceholderText("Notice Header / Title...")
-            self.input_ann_title.setStyleSheet("background-color: #374151; color: white; padding: 8px;")
+
+            self.combo_audience = QComboBox()
+            self.combo_audience.addItems(["All", "Students", "Faculty"])
 
             self.input_ann_content = QTextEdit()
             self.input_ann_content.setPlaceholderText("Announcement Body...")
             self.input_ann_content.setMaximumHeight(70)
-            self.input_ann_content.setStyleSheet("background-color: #374151; color: white; padding: 8px;")
 
             btn_post = QPushButton("Publish Announcement")
-            btn_post.setStyleSheet("background-color: #059669; color: white; font-weight: bold; padding: 10px; border-radius: 6px;")
+            btn_post.setCursor(Qt.PointingHandCursor)
+            btn_post.setProperty("class", "secondary")
             btn_post.clicked.connect(self._post_announcement)
 
             pf.addWidget(self.input_ann_title)
+            pf.addWidget(self.combo_audience)
             pf.addWidget(self.input_ann_content)
             pf.addWidget(btn_post)
             left_layout.addWidget(post_frame)
@@ -77,104 +95,116 @@ class NoticesAndRemindersWidget(QWidget):
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(10, 0, 0, 0)
 
-        rem_title = QLabel("Smart Academic Reminders")
-        rem_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #F59E0B;")
+        rem_title = QLabel("Academic Reminders")
+        rem_title.setStyleSheet("font-size: 14px; font-weight: 700; color: #0F172A;")
         right_layout.addWidget(rem_title)
 
         self.list_reminders = QListWidget()
-        self.list_reminders.setStyleSheet("""
-            QListWidget { background-color: #1F2937; color: #E5E7EB; font-size: 13px; border-radius: 8px; padding: 10px; }
-            QListWidget::item { border-bottom: 1px solid #374151; padding: 8px; }
-        """)
+        configure_wrapped_list(self.list_reminders)
         self.list_reminders.itemDoubleClicked.connect(self._toggle_reminder)
         right_layout.addWidget(self.list_reminders)
 
         rem_frame = QFrame()
-        rem_frame.setStyleSheet("background-color: #1E293B; border-radius: 8px; padding: 10px;")
+        rem_frame.setObjectName("surfaceCard")
+        rem_frame.setStyleSheet("""
+            QFrame#surfaceCard {
+                background-color: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+                padding: 14px;
+            }
+        """)
         rf = QVBoxLayout(rem_frame)
 
         rf_lbl = QLabel("Add New Reminder")
-        rf_lbl.setStyleSheet("font-weight: bold; color: #F59E0B;")
+        rf_lbl.setStyleSheet("font-weight: 700; font-size: 13px; color: #0F172A;")
         rf.addWidget(rf_lbl)
 
         rh = QHBoxLayout()
-        self.input_rem_title = QLineEdit()
-        self.input_rem_title.setPlaceholderText("Reminder Task (e.g. Viva submission)...")
-        self.input_rem_title.setStyleSheet("background-color: #374151; color: white; padding: 8px;")
+        self.combo_priority = QComboBox()
+        self.combo_priority.addItems(["Low", "Normal", "High", "Urgent"])
 
-        self.combo_rem_type = QComboBox()
-        self.combo_rem_type.addItems(["Assignment", "Lab Exam", "Viva", "General"])
-        self.combo_rem_type.setStyleSheet("background-color: #374151; color: white; padding: 6px;")
+        self.input_due_date = QLineEdit()
+        self.input_due_date.setPlaceholderText("Due Date (YYYY-MM-DD)...")
 
-        rh.addWidget(self.input_rem_title)
-        rh.addWidget(self.combo_rem_type)
+        rh.addWidget(self.combo_priority)
+        rh.addWidget(self.input_due_date)
         rf.addLayout(rh)
 
-        self.input_rem_date = QLineEdit()
-        self.input_rem_date.setPlaceholderText("Due Date (YYYY-MM-DD)...")
-        self.input_rem_date.setStyleSheet("background-color: #374151; color: white; padding: 8px;")
+        self.input_rem_text = QLineEdit()
+        self.input_rem_text.setPlaceholderText("Reminder description...")
 
-        btn_add_rem = QPushButton("Add Reminder")
-        btn_add_rem.setStyleSheet("background-color: #D97706; color: white; font-weight: bold; padding: 8px; border-radius: 6px;")
-        btn_add_rem.clicked.connect(self._add_reminder)
+        btn_rem = QPushButton("Add Reminder")
+        btn_rem.setCursor(Qt.PointingHandCursor)
+        btn_rem.clicked.connect(self._add_reminder)
 
-        rf.addWidget(self.input_rem_date)
-        rf.addWidget(btn_add_rem)
+        rf.addWidget(self.input_rem_text)
+        rf.addWidget(btn_rem)
+
         right_layout.addWidget(rem_frame)
-
         main_layout.addWidget(right_widget)
+
+        outer_layout.addLayout(main_layout)
 
         self.load_announcements()
         self.load_reminders()
 
     def load_announcements(self):
+        anns = get_announcements(self.role)
         self.list_announcements.clear()
-        anns = get_announcements()
         for a in anns:
-            # a: (id, name, title, content, target_group, created_at)
-            item_text = f"📢 [{a[5][:10]}] {a[2]}\nBy: {a[1]} | Target: {a[4]}\nDetails: {a[3]}"
+            created = a[5] if len(a) > 5 else "Recent"
+            item_text = f"Notice: {a[2]}  [Audience: {a[4]} | Author: {a[1]} - {created}]\n   {a[3]}"
             self.list_announcements.addItem(item_text)
-
-    def load_reminders(self):
-        self.list_reminders.clear()
-        rems = get_reminders(self.user[0])
-        for r in rems:
-            # r: (id, title, reminder_type, due_date, is_completed)
-            status_icon = "✅ [Completed]" if r[4] else "⏰ [Pending]"
-            item_text = f"{status_icon} [{r[2]}] {r[1]} — Due: {r[3]}"
-            item = QListWidgetItem(item_text)
-            item.setData(Qt.UserRole, r[0])
-            self.list_reminders.addItem(item)
 
     def _post_announcement(self):
         title = self.input_ann_title.text().strip()
-        content = self.input_ann_content.toPlainText().strip()
-        if not title or not content:
-            QMessageBox.warning(self, "Warning", "Please provide title and content.")
+        body = self.input_ann_content.toPlainText().strip()
+        if not title or not body:
+            QMessageBox.warning(self, "Warning", "Title and Body are required.")
             return
 
-        add_announcement(self.user[0], title, content, target_group="All")
-        QMessageBox.information(self, "Success", "Announcement posted!")
+        add_announcement(
+            faculty_id=self.user[0], title=title, content=body,
+            target_group=self.combo_audience.currentText(),
+        )
+        QMessageBox.information(self, "Success", "Announcement posted successfully!")
         self.input_ann_title.clear()
         self.input_ann_content.clear()
         self.load_announcements()
 
+    def load_reminders(self):
+        rems = get_reminders(self.user[0])
+        self.current_rems = rems
+        self.list_reminders.clear()
+        for r in rems:
+            status = "Completed" if r[4] else "Pending"
+            self.list_reminders.addItem(f"[{r[2]}] {r[1]} (Due: {r[3]}) - Status: {status} (Double click to toggle)")
+
     def _add_reminder(self):
-        title = self.input_rem_title.text().strip()
-        rtype = self.combo_rem_type.currentText()
-        due = self.input_rem_date.text().strip()
-        if not title or not due:
-            QMessageBox.warning(self, "Warning", "Please provide reminder task and due date.")
+        text = self.input_rem_text.text().strip()
+        prio = self.combo_priority.currentText()
+        due = self.input_due_date.text().strip()
+
+        if not text:
+            QMessageBox.warning(self, "Warning", "Reminder description is required.")
             return
 
-        add_reminder(self.user[0], title, rtype, due)
-        QMessageBox.information(self, "Success", "Reminder saved!")
-        self.input_rem_title.clear()
-        self.input_rem_date.clear()
+        try:
+            date.fromisoformat(due)
+        except ValueError:
+            QMessageBox.warning(self, "Invalid due date", "Enter the due date as YYYY-MM-DD.")
+            return
+
+        add_reminder(self.user[0], text, prio, due)
+        QMessageBox.information(self, "Success", "Reminder added!")
+        self.input_rem_text.clear()
+        self.input_due_date.clear()
         self.load_reminders()
 
-    def _toggle_reminder(self, item):
-        rem_id = item.data(Qt.UserRole)
-        if rem_id:
-            toggle_reminder_completed(rem_id)
+    def _toggle_reminder(self, item: QListWidgetItem):
+        row = self.list_reminders.row(item)
+        if hasattr(self, 'current_rems') and row < len(self.current_rems):
+            rem_id = self.current_rems[row][0]
+            toggle_reminder_completed(rem_id, self.user[0])
             self.load_reminders()

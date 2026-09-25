@@ -9,7 +9,7 @@ class LabMonitorEngine:
             import psutil
             cpu_percent = psutil.cpu_percent(interval=None)
             memory = psutil.virtual_memory()
-            disk = psutil.disk_usage('/')
+            disk = psutil.disk_usage(os.path.abspath(os.sep))
             net = psutil.net_io_counters()
 
             running_apps = []
@@ -36,34 +36,12 @@ class LabMonitorEngine:
                 "disk_free_gb": round(disk.free / (1024**3), 2),
                 "bytes_sent_mb": round(net.bytes_sent / (1024**2), 2),
                 "bytes_recv_mb": round(net.bytes_recv / (1024**2), 2),
-                "running_apps": running_apps if running_apps else ["code.exe", "python.exe"],
+                "running_apps": running_apps,
                 "status": status
             }
         except ImportError:
-            return {
-                "cpu_percent": 18.5,
-                "ram_percent": 45.2,
-                "ram_used_gb": 7.2,
-                "ram_total_gb": 16.0,
-                "disk_percent": 52.0,
-                "disk_free_gb": 115.0,
-                "bytes_sent_mb": 42.1,
-                "bytes_recv_mb": 110.5,
-                "running_apps": ["code.exe", "python.exe", "chrome.exe"],
-                "status": "Healthy (Simulated)"
-            }
+            return {"available": False, "status": "Monitoring unavailable: install psutil to show live workstation metrics."}
         except Exception as e:
-            return {
-                "cpu_percent": 20.0,
-                "ram_percent": 50.0,
-                "ram_used_gb": 8.0,
-                "ram_total_gb": 16.0,
-                "disk_percent": 50.0,
-                "disk_free_gb": 100.0,
-                "bytes_sent_mb": 10.0,
-                "bytes_recv_mb": 50.0,
-                "running_apps": ["python.exe"],
-                "status": f"Monitoring Active ({e})"
-            }
+            return {"available": False, "status": f"Monitoring unavailable: {e}"}
 
 lab_monitor = LabMonitorEngine()

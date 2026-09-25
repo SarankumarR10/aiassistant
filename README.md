@@ -2,6 +2,8 @@
 
 EduPilot is a desktop AI personal assistant for classroom management, attendance tracking, laboratory monitoring, code execution, student progress analytics, and voice-assisted studying built with **PySide6 (Qt for Python)** and **SQLite**.
 
+The application has database-backed faculty and student workflows. Microphone speech recognition needs a separately installed Vosk model. Face attendance remains disabled until consented enrollment and identity matching are implemented.
+
 ---
 
 ## 🚀 Quick Start for Team Members
@@ -20,6 +22,8 @@ You can set up and start the project in **one click** on Windows, macOS, or Linu
 2. Run `chmod +x setup.sh run.sh`
 3. Run `./setup.sh`
 4. Run `./run.sh` to launch EduPilot.
+
+If an existing virtual environment stops working after Python is moved or upgraded, run the setup script again. It checks `venv` first and rebuilds it when its base Python is no longer available.
 
 ---
 
@@ -49,6 +53,16 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### Isolated code runner (optional)
+
+Install Docker Desktop or Docker Engine with Linux containers enabled, then build the restricted execution image from the project root:
+
+```bash
+docker build -f docker/Dockerfile.runner -t edupilot-runner:latest docker
+```
+
+The runner has no network, a read-only base filesystem, a temporary per-run workspace, a 256 MB memory cap, process limit, and execution timeout. If Docker or the image is unavailable, EduPilot reports that code was not run. Do not switch this feature to direct host execution for untrusted programs.
+
 ---
 
 ## 🔑 Default Login Credentials
@@ -68,12 +82,23 @@ The project comes pre-seeded with test accounts for Faculty and Student roles:
 
 All dependencies are defined in `requirements.txt`:
 * **`PySide6`**: Modern Qt UI desktop framework.
-* **`opencv-python`**: Face detection and anti-proxy attendance feature.
+* **`opencv-python`**: Optional face detection only; detection is not identity verification.
 * **`numpy`**: Image processing & array mathematics.
 * **`pyttsx3`**: Offline Text-to-Speech (TTS) engine.
-* **`vosk`**: Offline Speech Recognition engine.
-* **`requests`**: HTTP library for fetching external resources.
+* **`vosk`**: Speech recognition library; a local Vosk model is not bundled.
+* **`sounddevice`**: Optional local microphone capture for offline Vosk transcription.
+* **`pypdf`**: Optional text extraction from course PDFs.
+* **`psutil`**: Optional live workstation monitoring.
+* **`qrcode[pil]`**: Optional QR image rendering; signed text check-ins work without it.
+* **`openpyxl`**: Excel exports for attendance and student transcripts.
 * **`tqdm`**, **`colorama`**: CLI utility formatting & progress indicators.
+
+### Optional offline speech input
+
+After installing `requirements.txt`, place an English Vosk model at
+`models/vosk-model-small-en-us-0.15`, or point `EDUPILOT_VOSK_MODEL` at the extracted model folder.
+The microphone controls become available in the faculty and student voice consoles when the model and
+audio dependency are detected. EduPilot does not upload audio or transcripts.
 
 ---
 
@@ -90,7 +115,7 @@ aiassistant/
 ├── database/                # SQLite database management & models
 ├── gui/                     # PySide6 desktop interface components
 ├── lab/                     # Code execution & laboratory monitor
-├── reports/                 # CSV and HTML report export generators
+├── reports/                 # CSV, HTML, PDF, and Excel report exports
 ├── voice/                   # Offline voice engine & speech commands
 └── docs/                    # Feature specifications & documentation
 ```
@@ -110,3 +135,6 @@ aiassistant/
 
 #### 3. Re-initializing or Resetting Data
 * To reset the database to factory default test data, delete `edupilot.db` inside the project folder (if generated) and run `python main.py`. The database will auto-rebuild on startup.
+
+#### 4. Existing virtual environment no longer starts
+* Run `setup.bat` on Windows or `./setup.sh` on macOS/Linux. The setup script checks the generated `venv` and recreates it if it is incomplete or points to a Python installation that has moved. Then use `run.bat` or `./run.sh` to launch EduPilot with that environment.

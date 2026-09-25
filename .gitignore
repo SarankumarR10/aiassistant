@@ -22,3 +22,7 @@ ENV/
 # Temporary files & artifacts
 tmp/
 *.zip
+
+# Generated presentation renders and local review deck exports
+.presentation-build/
+deliverables/

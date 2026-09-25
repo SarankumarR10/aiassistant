@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QTimer
 from lab.lab_monitor import lab_monitor
+from gui.theme import POSITIVUS_QSS, create_section_header
 
 class LabMonitorWidget(QWidget):
     def __init__(self):
@@ -11,63 +12,68 @@ class LabMonitorWidget(QWidget):
         self.init_ui()
 
     def init_ui(self):
-        self.setStyleSheet("background-color: #0F172A; color: #F8FAFC;")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(25, 25, 25, 25)
-        layout.setSpacing(20)
+        self.setStyleSheet(POSITIVUS_QSS)
 
-        title = QLabel("Smart Lab Monitoring & System Health")
-        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #FFFFFF;")
-        layout.addWidget(title)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
+
+        header = create_section_header("Lab Monitor & System Health", "Real-time CPU, RAM, Disk & Process tracking")
+        layout.addWidget(header)
+        self.status_label = QLabel("Connecting to workstation metrics…")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
 
         # Metrics Container Card
         metrics_card = QFrame()
+        metrics_card.setObjectName("surfaceCard")
         metrics_card.setStyleSheet("""
-            QFrame {
-                background-color: rgba(30, 41, 59, 0.55);
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 16px;
-                padding: 15px;
+            QFrame#surfaceCard {
+                background-color: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+                padding: 16px;
             }
         """)
         metrics_layout = QVBoxLayout(metrics_card)
-        metrics_layout.setSpacing(18)
+        metrics_layout.setSpacing(16)
 
-        self.cpu_bar, self.cpu_lbl = self._add_metric_row(metrics_layout, "CPU Utilization", "#3B82F6")
-        self.ram_bar, self.ram_lbl = self._add_metric_row(metrics_layout, "RAM Memory Usage", "#10B981")
-        self.disk_bar, self.disk_lbl = self._add_metric_row(metrics_layout, "Disk Storage Used", "#8B5CF6")
+        self.cpu_bar, self.cpu_lbl = self._add_metric_row(metrics_layout, "CPU Utilization")
+        self.ram_bar, self.ram_lbl = self._add_metric_row(metrics_layout, "RAM Memory Usage")
+        self.disk_bar, self.disk_lbl = self._add_metric_row(metrics_layout, "Disk Storage Used")
+        self.network_label = QLabel("Network traffic: unavailable")
+        self.network_label.setStyleSheet("color: #687782; font-size: 12px;")
+        metrics_layout.addWidget(self.network_label)
 
         layout.addWidget(metrics_card)
 
         # Running Processes Section
         processes_card = QFrame()
+        processes_card.setObjectName("surfaceCard")
         processes_card.setStyleSheet("""
-            QFrame {
-                background-color: rgba(30, 41, 59, 0.45);
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                border-radius: 16px;
-                padding: 15px;
+            QFrame#surfaceCard {
+                background-color: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+                padding: 16px;
             }
         """)
         proc_layout = QVBoxLayout(processes_card)
 
         apps_lbl = QLabel("Running Workstation Tools & Processes")
-        apps_lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #60A5FA; margin-bottom: 8px;")
+        apps_lbl.setStyleSheet("font-size: 14px; font-weight: 700; color: #0F172A; margin-bottom: 6px;")
         proc_layout.addWidget(apps_lbl)
 
         self.apps_list = QListWidget()
         self.apps_list.setStyleSheet("""
             QListWidget {
-                background-color: rgba(15, 23, 42, 0.6);
-                color: #34D399;
-                font-family: Consolas, 'Courier New', monospace;
+                background-color: #F8FAFC;
+                color: #0F172A;
+                font-family: 'Consolas', monospace;
                 font-size: 13px;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 8px;
-                padding: 8px;
-            }
-            QListWidget::item {
-                padding: 6px 4px;
+                border: 1px solid #E2E8F0;
+                border-radius: 6px;
+                padding: 6px;
             }
         """)
         proc_layout.addWidget(self.apps_list)
@@ -81,30 +87,15 @@ class LabMonitorWidget(QWidget):
 
         self.update_metrics()
 
-    def _add_metric_row(self, layout, title: str, accent_color: str):
+    def _add_metric_row(self, layout, title: str):
         row = QVBoxLayout()
         row.setSpacing(6)
 
         lbl = QLabel(f"{title}: --%")
-        lbl.setStyleSheet("font-size: 15px; font-weight: 600; color: #F8FAFC;")
+        lbl.setStyleSheet("font-size: 13px; font-weight: 600; color: #0F172A;")
 
         bar = QProgressBar()
-        bar.setMinimumHeight(24)
-        bar.setStyleSheet(f"""
-            QProgressBar {{
-                border: 1px solid rgba(255, 255, 255, 0.15);
-                border-radius: 8px;
-                text-align: center;
-                background-color: rgba(15, 23, 42, 0.8);
-                color: #FFFFFF;
-                font-weight: bold;
-                font-size: 12px;
-            }}
-            QProgressBar::chunk {{
-                background-color: {accent_color};
-                border-radius: 6px;
-            }}
-        """)
+        bar.setMinimumHeight(20)
         row.addWidget(lbl)
         row.addWidget(bar)
         layout.addLayout(row)
@@ -113,6 +104,16 @@ class LabMonitorWidget(QWidget):
     def update_metrics(self):
         try:
             metrics = lab_monitor.get_system_health()
+            if not metrics.get("available", True):
+                self.status_label.setText(metrics["status"])
+                for bar, label in ((self.cpu_bar, self.cpu_lbl), (self.ram_bar, self.ram_lbl), (self.disk_bar, self.disk_lbl)):
+                    bar.setValue(0)
+                    label.setText(label.text().split(":")[0] + ": unavailable")
+                self.apps_list.clear()
+                self.apps_list.addItem("Live process list is unavailable.")
+                self.network_label.setText("Network traffic: unavailable")
+                return
+            self.status_label.setText(f"Live workstation status: {metrics['status']}")
             
             self.cpu_bar.setValue(int(metrics["cpu_percent"]))
             self.cpu_lbl.setText(f"CPU Utilization: {metrics['cpu_percent']}%")
@@ -122,9 +123,12 @@ class LabMonitorWidget(QWidget):
 
             self.disk_bar.setValue(int(metrics["disk_percent"]))
             self.disk_lbl.setText(f"Disk Storage Used: {metrics['disk_percent']}%  [{metrics['disk_free_gb']} GB Free]")
+            self.network_label.setText(
+                f"Network totals: {metrics['bytes_sent_mb']} MB sent · {metrics['bytes_recv_mb']} MB received"
+            )
 
             self.apps_list.clear()
             for app in metrics["running_apps"]:
                 self.apps_list.addItem(f"{app} (Active)")
-        except Exception:
-            pass
+        except Exception as error:
+            self.status_label.setText(f"Could not refresh workstation metrics: {error}")
