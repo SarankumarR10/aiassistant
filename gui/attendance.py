@@ -190,7 +190,7 @@ class AttendanceWindow(QWidget):
         self.section_combo.currentIndexChanged.connect(self._load_section_students)
 
     def load_data(self):
-        all_students = get_students()
+        all_students = get_students(faculty_id=self.faculty_id)
         subjects = get_subjects()
 
         self.section_combo.blockSignals(True)
@@ -206,7 +206,7 @@ class AttendanceWindow(QWidget):
 
     def _load_section_students(self, *_):
         section = self.section_combo.currentText()
-        self.students = get_students(section) if section else []
+        self.students = get_students(section, faculty_id=self.faculty_id) if section else []
         self.table.setRowCount(len(self.students))
         self.statuses.clear()
         self.verification_methods.clear()

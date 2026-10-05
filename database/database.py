@@ -1,9 +1,11 @@
 import sqlite3
 import hashlib
 import hmac
+import os
 import secrets
+import sys
 from contextlib import closing
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 
@@ -12,7 +14,26 @@ from pathlib import Path
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "edupilot.db"
+PROJECT_DIR = BASE_DIR.parent
+
+
+def get_app_data_dir() -> Path:
+    """Return a writable per-user data directory on Windows, macOS, and Linux."""
+    configured = os.environ.get("EDUPILOT_DATA_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if sys.platform == "win32":
+        root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        return root / "EduPilot"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "EduPilot"
+    root = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return root / "edupilot"
+
+
+APP_DATA_DIR = get_app_data_dir()
+LEGACY_DB_PATH = BASE_DIR / "edupilot.db"
+DB_PATH = Path(os.environ.get("EDUPILOT_DB_PATH", APP_DATA_DIR / "edupilot.db")).expanduser()
 _PASSWORD_ITERATIONS = 240_000
 
 
@@ -46,9 +67,28 @@ def _audit(cursor, user_id: int | None, action: str, details: str = "") -> None:
 
 
 def get_connection():
-    connection = sqlite3.connect(DB_PATH)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if (not os.environ.get("EDUPILOT_DB_PATH")
+            and DB_PATH.resolve() != LEGACY_DB_PATH.resolve()
+            and not DB_PATH.exists() and LEGACY_DB_PATH.is_file()):
+        old_database = sqlite3.connect(LEGACY_DB_PATH)
+        new_database = sqlite3.connect(DB_PATH)
+        try:
+            old_database.backup(new_database)
+        finally:
+            old_database.close()
+            new_database.close()
+    connection = sqlite3.connect(DB_PATH, timeout=10)
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 10000")
     return connection
+
+
+def _ensure_column(cursor, table: str, column: str, declaration: str) -> None:
+    """Apply an additive SQLite schema migration only when the column is missing."""
+    present = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
+    if column not in present:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
 def get_or_create_app_secret(name: str) -> str:
@@ -134,10 +174,7 @@ def initialize_database():
         )
     """)
     for column, declaration in (("started_at", "TEXT"), ("expires_at", "INTEGER")):
-        try:
-            cursor.execute(f"ALTER TABLE lab_exam_submissions ADD COLUMN {column} {declaration}")
-        except sqlite3.OperationalError:
-            pass
+        _ensure_column(cursor, "lab_exam_submissions", column, declaration)
     cursor.execute("UPDATE lab_exam_submissions SET started_at = COALESCE(started_at, submitted_at, CURRENT_TIMESTAMP)")
 
     # --------------------------------------------------------
@@ -216,12 +253,7 @@ def initialize_database():
         )
     """)
 
-    try:
-        cursor.execute(
-            "ALTER TABLE attendance_records ADD COLUMN verification_method TEXT NOT NULL DEFAULT 'manual'"
-        )
-    except sqlite3.OperationalError:
-        pass
+    _ensure_column(cursor, "attendance_records", "verification_method", "TEXT NOT NULL DEFAULT 'manual'")
 
     # --------------------------------------------------------
     # ACADEMICS
@@ -345,16 +377,9 @@ def initialize_database():
             name
         ))
 
-    # Add face_encoding and qr_token columns to students table if not existing
-    try:
-        cursor.execute("ALTER TABLE students ADD COLUMN face_encoding TEXT")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cursor.execute("ALTER TABLE students ADD COLUMN qr_token TEXT")
-    except sqlite3.OperationalError:
-        pass
+    # Legacy compatibility columns; face matching is intentionally not enabled.
+    _ensure_column(cursor, "students", "face_encoding", "TEXT")
+    _ensure_column(cursor, "students", "qr_token", "TEXT")
 
     # --------------------------------------------------------
     # TIMETABLE
@@ -403,10 +428,7 @@ def initialize_database():
             FOREIGN KEY(student_id) REFERENCES students(id)
         )
     """)
-    try:
-        cursor.execute("ALTER TABLE assignment_submissions ADD COLUMN graded_at TEXT")
-    except sqlite3.OperationalError:
-        pass
+    _ensure_column(cursor, "assignment_submissions", "graded_at", "TEXT")
 
     # --------------------------------------------------------
     # NOTES & QUESTION BANKS
@@ -439,10 +461,7 @@ def initialize_database():
         )
     """)
     for column, declaration in (("source_kind", "TEXT NOT NULL DEFAULT 'Model'"), ("exam_year", "INTEGER")):
-        try:
-            cursor.execute(f"ALTER TABLE question_banks ADD COLUMN {column} {declaration}")
-        except sqlite3.OperationalError:
-            pass
+        _ensure_column(cursor, "question_banks", column, declaration)
 
     # --------------------------------------------------------
     # DOCUMENTS & CHUNKS (RAG)
@@ -572,6 +591,12 @@ def initialize_database():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_assistant_query_events_created_at ON assistant_query_events(created_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_attendance_sessions_date_subject ON attendance_sessions(class_date, subject_id, section)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignments_due_date ON assignments(due_date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignment_submissions_assignment_date ON assignment_submissions(assignment_id, submitted_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_document ON document_chunks(document_id, chunk_index)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_announcements_target_date ON announcements(target_group, created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reminders_owner_due ON reminders(user_id, due_date)")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS app_settings (
@@ -579,6 +604,19 @@ def initialize_database():
             value TEXT NOT NULL
         )
     """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stored_files (
+            storage_key TEXT PRIMARY KEY,
+            original_name TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+            uploaded_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(uploaded_by) REFERENCES users(id) ON DELETE SET NULL
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_stored_files_owner ON stored_files(uploaded_by, created_at DESC)")
 
     # Populate Initial Sample Data for Timetables, Experiments, FAQs, Questions, Announcements
     cursor.execute("SELECT COUNT(*) FROM timetables")
@@ -692,16 +730,16 @@ def initialize_database():
     cursor.execute("SELECT COUNT(*) FROM assignments")
     if cursor.fetchone()[0] == 0:
         sample_assignments = [
-            (4, "Python List Comprehensions & Lambdas", "Implement 5 matrix operations using list comprehensions and lambda functions.", "2026-08-20"),
-            (2, "ER Diagram & Schema Design", "Design an ER diagram for a Hospital Management System and convert it to 3NF relations.", "2026-08-25"),
+            (4, "Python List Comprehensions & Lambdas", "Implement five matrix operations using list comprehensions and lambda functions.", (date.today() + timedelta(days=7)).isoformat()),
+            (2, "ER Diagram & Schema Design", "Design an ER diagram for a Hospital Management System and convert it to 3NF relations.", (date.today() + timedelta(days=14)).isoformat()),
         ]
         cursor.executemany("INSERT INTO assignments (subject_id, title, description, due_date) VALUES (?, ?, ?, ?)", sample_assignments)
 
     cursor.execute("SELECT COUNT(*) FROM announcements")
     if cursor.fetchone()[0] == 0:
         sample_announcements = [
-            (1, "Lab Exam Scheduled for Next Week", "The practical examination for DBMS Lab (CS302) is scheduled for Friday at 10:00 AM.", "All"),
-            (1, "Submission Deadline Extended", "Assignment 1 submission deadline for Python Programming is extended to August 20th.", "Students")
+            (1, "Practical Exam Information", "Check the active exam workspace or ask faculty for the confirmed practical examination schedule.", "All"),
+            (1, "Assignment Submission Reminder", "Review each published assignment for its current due date and submission instructions.", "Students")
         ]
         cursor.executemany("INSERT INTO announcements (faculty_id, title, content, target_group) VALUES (?, ?, ?, ?)", sample_announcements)
 
@@ -717,8 +755,11 @@ def initialize_database():
     cursor.execute("UPDATE lab_exams SET is_active = 0 WHERE is_active = 1 AND id <> (SELECT MAX(id) FROM lab_exams WHERE is_active = 1)")
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lab_exams_single_active ON lab_exams(is_active) WHERE is_active = 1")
 
+    cursor.execute("PRAGMA user_version = 2")
     connection.commit()
     connection.close()
+    from storage.local_storage import storage_service
+    storage_service.remove_orphaned_files()
 
 
 # ============================================================
@@ -755,10 +796,15 @@ def authenticate_user(username, password):
 # GET STUDENTS
 # ============================================================
 
-def get_students(section: str | None = None):
-
+def get_students(section: str | None = None, *, faculty_id: int):
     connection = get_connection()
     cursor = connection.cursor()
+
+    cursor.execute("SELECT role FROM users WHERE id = ?", (faculty_id,))
+    role = cursor.fetchone()
+    if not role or role[0] != "faculty":
+        connection.close()
+        raise PermissionError("Only faculty can view the student directory.")
 
     query = """
         SELECT
@@ -1024,18 +1070,22 @@ def get_student_academic_records(user_id: int):
     return rows
 
 
-def get_all_academic_records():
+def get_all_academic_records(faculty_id: int):
     conn = get_connection()
-    rows = conn.execute("""
-        SELECT st.id, st.roll_number, st.name, s.id, s.code, s.name,
-               a.internal_mark, a.assignment_mark, a.lab_mark, a.total_mark
-        FROM students st
-        CROSS JOIN subjects s
-        LEFT JOIN academics a ON a.student_id = st.id AND a.subject_id = s.id
-        ORDER BY st.roll_number, s.code
-    """).fetchall()
-    conn.close()
-    return rows
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can view all academic records.")
+        return conn.execute("""
+            SELECT st.id, st.roll_number, st.name, s.id, s.code, s.name,
+                   a.internal_mark, a.assignment_mark, a.lab_mark, a.total_mark
+            FROM students st
+            CROSS JOIN subjects s
+            LEFT JOIN academics a ON a.student_id = st.id AND a.subject_id = s.id
+            ORDER BY st.roll_number, s.code
+        """).fetchall()
+    finally:
+        conn.close()
 
 
 def save_academic_record(student_id: int, subject_id: int, internal_mark: float,
@@ -1560,9 +1610,12 @@ def record_assistant_query_event(category: str = "learning") -> None:
         conn.close()
 
 
-def get_classroom_activity_stats() -> dict:
+def get_classroom_activity_stats(faculty_id: int) -> dict:
     conn = get_connection()
     try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can view classroom activity analytics.")
         return {
             "learning_queries_today": conn.execute(
                 "SELECT COUNT(*) FROM assistant_query_events WHERE category = 'learning' AND date(created_at, 'localtime') = date('now', 'localtime')"
@@ -1587,20 +1640,22 @@ def get_classroom_activity_stats() -> dict:
         conn.close()
 
 
-def get_assignment_submissions(assignment_id: int):
+def get_assignment_submissions(assignment_id: int, faculty_id: int):
     conn = get_connection()
-    c = conn.cursor()
-    c.execute("""
-        SELECT sub.id, st.roll_number, st.name, sub.submission_text, sub.file_path,
-               sub.submitted_at, sub.marks, sub.feedback, sub.graded_at
-        FROM assignment_submissions sub
-        JOIN students st ON st.id = sub.student_id
-        WHERE sub.assignment_id = ?
-        ORDER BY sub.submitted_at DESC
-    """, (assignment_id,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can view assignment submissions.")
+        return conn.execute("""
+            SELECT sub.id, st.roll_number, st.name, sub.submission_text, sub.file_path,
+                   sub.submitted_at, sub.marks, sub.feedback, sub.graded_at
+            FROM assignment_submissions sub
+            JOIN students st ON st.id = sub.student_id
+            WHERE sub.assignment_id = ?
+            ORDER BY sub.submitted_at DESC
+        """, (assignment_id,)).fetchall()
+    finally:
+        conn.close()
 
 
 def get_student_lab_progress(user_id: int):
@@ -1682,12 +1737,16 @@ def review_lab_submission(submission_id: int, faculty_id: int, decision: str) ->
         conn.close()
 
 
-def get_lab_exam_catalog():
+def get_lab_exam_catalog(faculty_id: int):
     conn = get_connection()
-    rows = conn.execute("""SELECT e.id, s.code, s.name, e.title, e.duration_minutes, e.is_active, e.created_at
-        FROM lab_exams e JOIN subjects s ON s.id = e.subject_id ORDER BY e.created_at DESC, e.id DESC""").fetchall()
-    conn.close()
-    return rows
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can view the practical exam catalog.")
+        return conn.execute("""SELECT e.id, s.code, s.name, e.title, e.duration_minutes, e.is_active, e.created_at
+            FROM lab_exams e JOIN subjects s ON s.id = e.subject_id ORDER BY e.created_at DESC, e.id DESC""").fetchall()
+    finally:
+        conn.close()
 
 
 def publish_lab_exam(subject_id: int, title: str, question_paper: str, duration_minutes: int, faculty_id: int) -> int:
@@ -1760,29 +1819,67 @@ def get_student_assignment_submission(assignment_id: int, user_id: int):
 
 
 def submit_assignment(assignment_id: int, user_id: int, submission_text: str, file_path: str = ""):
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT id FROM students WHERE user_id = ?", (user_id,))
-    st = c.fetchone()
-    if not st:
-        conn.close()
-        return False
-    student_id = st[0]
+    from storage.local_storage import STORAGE_PREFIX, storage_service
 
-    c.execute("""
-        INSERT INTO assignment_submissions (assignment_id, student_id, submission_text, file_path, marks, feedback, graded_at)
-        VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-        ON CONFLICT(assignment_id, student_id) DO UPDATE SET
-            submission_text = excluded.submission_text,
-            file_path = excluded.file_path,
-            submitted_at = CURRENT_TIMESTAMP,
-            marks = NULL,
-            feedback = NULL,
-            graded_at = NULL
-    """, (assignment_id, student_id, submission_text, file_path))
-    _audit(c, user_id, "assignment.submitted", f"assignment={assignment_id}; student={student_id}")
-    conn.commit()
-    conn.close()
+    conn = get_connection()
+    try:
+        student = conn.execute(
+            "SELECT id FROM students WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        assignment = conn.execute(
+            "SELECT 1 FROM assignments WHERE id = ?", (assignment_id,)
+        ).fetchone()
+        if not student:
+            return False
+        if not assignment:
+            raise ValueError("This assignment is no longer available.")
+        previous = conn.execute(
+            "SELECT file_path FROM assignment_submissions WHERE assignment_id = ? AND student_id = ?",
+            (assignment_id, student[0]),
+        ).fetchone()
+        old_reference = previous[0] if previous else ""
+    finally:
+        conn.close()
+
+    new_upload = False
+    reference = file_path.strip()
+    if reference:
+        if reference.startswith(STORAGE_PREFIX):
+            if not storage_service.owned_by(reference, user_id):
+                raise PermissionError("That attachment does not belong to this student account.")
+        else:
+            reference = storage_service.store_file(
+                reference, uploaded_by=user_id, category="assignment_submissions"
+            )
+            new_upload = True
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO assignment_submissions
+                (assignment_id, student_id, submission_text, file_path, marks, feedback, graded_at)
+            VALUES (?, ?, ?, ?, NULL, NULL, NULL)
+            ON CONFLICT(assignment_id, student_id) DO UPDATE SET
+                submission_text = excluded.submission_text,
+                file_path = excluded.file_path,
+                submitted_at = CURRENT_TIMESTAMP,
+                marks = NULL,
+                feedback = NULL,
+                graded_at = NULL
+        """, (assignment_id, student[0], submission_text, reference))
+        _audit(cursor, user_id, "assignment.submitted", f"assignment={assignment_id}; student={student[0]}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        if new_upload:
+            storage_service.remove(reference)
+        raise
+    finally:
+        conn.close()
+
+    if old_reference and old_reference != reference and old_reference.startswith(STORAGE_PREFIX):
+        storage_service.remove(old_reference)
     return True
 
 

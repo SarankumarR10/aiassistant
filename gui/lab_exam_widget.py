@@ -80,7 +80,7 @@ class FacultyLabExamWidget(QWidget):
         layout.addWidget(self.solution)
 
     def refresh(self):
-        rows = get_lab_exam_catalog()
+        rows = get_lab_exam_catalog(self.faculty_id)
         self.table.setRowCount(len(rows))
         for index, row in enumerate(rows):
             exam_id, code, subject, title, duration, active, created = row

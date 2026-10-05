@@ -1,31 +1,48 @@
 """Offline retrieval from approved FAQs and locally indexed course documents."""
-import os
 import re
 import sqlite3
 from datetime import datetime
 from database.database import (
     get_connection, _audit, get_timetables, get_announcements, record_assistant_query_event,
 )
+from storage.local_storage import storage_service
 
 
 class OfflineRAGEngine:
     def ingest_file(self, title: str, file_path: str, subject_id: int = 1,
                     *, uploaded_by: int, unit_number: int = 1) -> int:
-        if not os.path.isfile(file_path):
-            raise FileNotFoundError(f"Document not found: {file_path}")
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext == ".pdf":
-            try:
-                from pypdf import PdfReader
-                text = "\n\n".join(page.extract_text() or "" for page in PdfReader(file_path).pages)
-            except ImportError as error:
-                raise RuntimeError("Install pypdf to index PDF documents.") from error
-        else:
-            with open(file_path, "r", encoding="utf-8", errors="strict") as stream:
-                text = stream.read()
-        if not text.strip():
-            raise ValueError("This document contains no extractable text to index.")
-        return self.ingest_text_document(title, text, subject_id, file_path, uploaded_by, unit_number)
+        conn = get_connection()
+        try:
+            role = conn.execute("SELECT role FROM users WHERE id = ?", (uploaded_by,)).fetchone()
+        finally:
+            conn.close()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can add course documents.")
+        reference = storage_service.store_file(
+            file_path, uploaded_by=uploaded_by, category="course_materials",
+            allowed_extensions={".pdf", ".txt", ".md"}, max_bytes=25 * 1024 * 1024,
+        )
+        stored_path = storage_service.resolve(reference)
+        try:
+            ext = stored_path.suffix.lower()
+            if ext == ".pdf":
+                try:
+                    from pypdf import PdfReader
+                    text = "\n\n".join(page.extract_text() or "" for page in PdfReader(str(stored_path)).pages)
+                except ImportError as error:
+                    raise RuntimeError("Install pypdf to index PDF documents.") from error
+            else:
+                with stored_path.open("r", encoding="utf-8", errors="strict") as stream:
+                    text = stream.read()
+            if not text.strip():
+                raise ValueError("This document contains no extractable text to index.")
+            return self.ingest_text_document(
+                title, text, subject_id, reference,
+                uploaded_by=uploaded_by, unit_number=unit_number,
+            )
+        except Exception:
+            storage_service.remove(reference)
+            raise
 
     def ingest_text_document(self, title: str, content: str, subject_id: int = 1,
                              file_path: str = "text_content", *, uploaded_by: int,

@@ -80,7 +80,7 @@ class AcademicTrackerWidget(QWidget):
     def load_records(self):
         self.table.setRowCount(0)
         if self.role == "faculty":
-            rows = get_all_academic_records()
+            rows = get_all_academic_records(self.user[0])
             for row, record in enumerate(rows):
                 student_id, roll, student, subject_id, code, subject, internal, assignment, lab, total = record
                 self.table.insertRow(row)

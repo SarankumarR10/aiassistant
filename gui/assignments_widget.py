@@ -3,7 +3,8 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit,
     QLineEdit, QComboBox, QFileDialog, QMessageBox, QFrame, QSplitter
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from datetime import date
 from database.database import (
     get_subjects,
@@ -15,6 +16,7 @@ from database.database import (
     grade_submission
 )
 from gui.theme import POSITIVUS_QSS, create_section_header
+from storage.local_storage import storage_service
 
 class AssignmentsWidget(QWidget):
     """
@@ -162,6 +164,11 @@ class AssignmentsWidget(QWidget):
 
             gv.addWidget(self.lbl_selected_student)
             gv.addWidget(self.txt_submission_content)
+            self.open_attachment_button = QPushButton("Open Attached File")
+            self.open_attachment_button.setProperty("class", "outline")
+            self.open_attachment_button.setEnabled(False)
+            self.open_attachment_button.clicked.connect(self._open_selected_attachment)
+            gv.addWidget(self.open_attachment_button)
             gv.addLayout(gh)
             gv.addWidget(self.input_feedback)
             right_layout.addWidget(grade_frame)
@@ -267,13 +274,16 @@ class AssignmentsWidget(QWidget):
                 grade = f"Graded: {marks:g}/{assignment[6]}" if graded_at else "Awaiting grade"
                 feedback_text = f"\nFeedback: {feedback}" if feedback else ""
                 status = f"Submitted {submitted_at} · {grade}{feedback_text}"
-                if content or file_path:
-                    self.student_sub_text.setPlainText(content or "")
-                    self.input_filepath.setText(file_path or "")
+                self.student_sub_text.setPlainText(content or "")
+                self._existing_attachment_reference = file_path or ""
+                self.input_filepath.setText(storage_service.file_name(file_path) if file_path else "")
+                self.input_filepath.setReadOnly(bool(file_path))
             else:
                 status = "Not submitted yet"
                 self.student_sub_text.clear()
                 self.input_filepath.clear()
+                self.input_filepath.setReadOnly(False)
+                self._existing_attachment_reference = ""
             instructions = assignment[4] or "No additional instructions provided."
             self.lbl_assignment_info.setText(
                 f"{title}\nDue: {assignment[5]} · Maximum: {assignment[6]} marks\n\n"
@@ -281,7 +291,7 @@ class AssignmentsWidget(QWidget):
             )
 
     def _load_submissions(self, assignment_id: int):
-        submissions = get_assignment_submissions(assignment_id)
+        submissions = get_assignment_submissions(assignment_id, faculty_id=self.user[0])
         self.current_submissions = submissions
         self.table_submissions.setRowCount(len(submissions))
         for row, s in enumerate(submissions):
@@ -300,7 +310,15 @@ class AssignmentsWidget(QWidget):
         sub = self.current_submissions[row]
         self.selected_submission_id = sub[0]
         self.lbl_selected_student.setText(f"Grading Student: {sub[2]} ({sub[1]})")
-        self.txt_submission_content.setText(sub[3] if sub[3] else f"[File Attached: {sub[4]}]")
+        attachment = sub[4] or ""
+        self.attachment_reference = attachment
+        self.open_attachment_button.setEnabled(bool(attachment))
+        if sub[3]:
+            self.txt_submission_content.setText(sub[3])
+        elif attachment:
+            self.txt_submission_content.setText(f"Attached file: {storage_service.file_name(attachment)}")
+        else:
+            self.txt_submission_content.clear()
         if sub[8] and sub[6] is not None:
             self.input_marks.setText(str(sub[6]))
         else:
@@ -331,21 +349,42 @@ class AssignmentsWidget(QWidget):
     def _browse_file(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Attach Submission File")
         if fname:
+            self._existing_attachment_reference = ""
+            self.input_filepath.setReadOnly(False)
             self.input_filepath.setText(fname)
+
+    def _open_selected_attachment(self):
+        reference = getattr(self, "attachment_reference", "")
+        if not reference:
+            return
+        try:
+            path = storage_service.resolve(reference)
+            if not path.is_file():
+                raise FileNotFoundError("The attached file is no longer available.")
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))):
+                raise OSError("No application is registered to open this file.")
+        except Exception as error:
+            QMessageBox.warning(self, "Could not open attachment", str(error))
 
     def _submit_assignment(self):
         if not hasattr(self, 'selected_assignment_id'):
             QMessageBox.warning(self, "Warning", "Please select an assignment from the left table first.")
             return
         content = self.student_sub_text.toPlainText().strip()
-        filepath = self.input_filepath.text().strip()
+        filepath = getattr(self, "_existing_attachment_reference", "") or self.input_filepath.text().strip()
         if not content and not filepath:
             QMessageBox.warning(self, "Warning", "Please enter text/code solution or attach a file.")
             return
 
-        if not submit_assignment(self.selected_assignment_id, self.user[0], content, filepath):
-            QMessageBox.critical(self, "Submission failed", "Your student account could not be matched to a student record.")
+        try:
+            if not submit_assignment(self.selected_assignment_id, self.user[0], content, filepath):
+                QMessageBox.critical(self, "Submission failed", "Your student account could not be matched to a student record.")
+                return
+        except Exception as error:
+            QMessageBox.critical(self, "Submission failed", str(error))
             return
         QMessageBox.information(self, "Success", "Assignment submitted successfully!")
         self.student_sub_text.clear()
         self.input_filepath.clear()
+        self.input_filepath.setReadOnly(False)
+        self._existing_attachment_reference = ""

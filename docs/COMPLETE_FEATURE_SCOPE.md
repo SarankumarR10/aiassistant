@@ -6,11 +6,15 @@ This document is the approved feature scope for EduPilot, a local-first personal
 
 The application now includes persistent role-based attendance, student academic marks, assignments and grading, lab submissions with faculty review, practical-exam publishing and timing, scoped reminders and notices, local course-document retrieval, data exports, and faculty/student workspaces. The following capabilities remain deliberately limited until their required models or safeguards exist:
 
+- The supported architecture is a local-first PySide6 desktop application. Screens call Python feature services directly; those services enforce role checks and use parameterized SQLite queries. There is no REST server, web client, CORS policy, or remote identity provider in this project.
+- Structured records live in per-user SQLite storage. Course documents and assignment attachments are copied into a managed local file directory, while the database stores opaque file keys and metadata. `EDUPILOT_DATA_DIR`, `EDUPILOT_DB_PATH`, and `EDUPILOT_FILES_DIR` can relocate data. Legacy project-folder databases are copied using SQLite's backup API on first launch.
+- The managed local storage service enforces a 25 MB upload ceiling, an extension allowlist, random file names, and path containment checks. Cloud/S3 storage, signed URLs, and shared multi-device file access are not implemented; a remote provider is only recommended if the product changes to a client/server deployment.
+
 - Voice commands can be entered as text or captured from the microphone with a configured local Vosk model and `sounddevice`. The model is not bundled; text-to-speech remains optional.
 - Face attendance is disabled because face detection alone cannot identify a student. QR check-in uses signed, section-bound five-minute codes; students can scan locally with OpenCV or paste the token, then explicitly submit it for validation.
 - The code runner requires the optional `edupilot-runner` Docker image. It uses no network, read-only base filesystem, a temporary workspace, memory/process limits, timeout, and explicit confirmation; it does not execute code directly on the host.
 - Practical exam submissions and start/deadline times are saved locally and enforced on submission. Faculty can publish and close active practical exams. Screen locking remains disabled.
-- Workstation metrics require `psutil`; PDF indexing requires `pypdf`; scannable QR rendering requires `qrcode`; Excel exports require `openpyxl`. Missing runtime dependencies are reported instead of replaced with sample data.
+- Workstation metrics require `psutil`; PDF indexing requires `pypdf`; scannable QR rendering requires `qrcode`; Excel exports require `openpyxl`. Missing optional runtime dependencies are reported instead of replaced with sample data.
 - Analytics and reports are based on recorded data. Empty data is shown as unavailable rather than as a fabricated percentage.
 - Setup scripts check Python 3.10+ and detect a broken generated virtual environment; the run scripts report how to rebuild it.
 - The offline tutor includes 23 curated starter FAQs across programming and core computer-science subjects. Faculty can extend the local knowledge base with approved notes and questions.

@@ -75,7 +75,7 @@ class StudentDirectoryWidget(QWidget):
         self.load_students()
 
     def load_students(self):
-        self.all_students = get_students()
+        self.all_students = get_students(faculty_id=self.faculty_id)
         self.filter_students()
 
     def filter_students(self):
@@ -366,7 +366,7 @@ class FacultyDashboard(QMainWindow):
 
         pages = (
             self._build_overview_page(), self._build_attendance_page(),
-            StudentDirectoryWidget(self.user[0]), ClassroomAnalyticsWidget(),
+            StudentDirectoryWidget(self.user[0]), ClassroomAnalyticsWidget(self.user[0]),
             AcademicTrackerWidget(self.user, role="faculty"),
             AssignmentsWidget(self.user, role="faculty"),
             NotesAndQuestionBankWidget(self.user, role="faculty"),

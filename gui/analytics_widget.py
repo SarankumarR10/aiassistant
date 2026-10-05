@@ -7,8 +7,9 @@ from gui.theme import POSITIVUS_QSS, create_section_header
 
 class ClassroomAnalyticsWidget(QWidget):
     """Attendance, learning-query, lab-work, and daily activity analytics."""
-    def __init__(self):
+    def __init__(self, faculty_id: int):
         super().__init__()
+        self.faculty_id = faculty_id
         self.init_ui()
 
     def init_ui(self):
@@ -56,7 +57,7 @@ class ClassroomAnalyticsWidget(QWidget):
 
     def load_analytics_data(self):
         rows = get_attendance_analytics()
-        activity = get_classroom_activity_stats()
+        activity = get_classroom_activity_stats(self.faculty_id)
         measured = [row[4] for row in rows if row[2] > 0]
         values = [f"{sum(measured) / len(measured):.1f}%" if measured else "—",
                   str(sum(pct < 75 for pct in measured)) if measured else "—",

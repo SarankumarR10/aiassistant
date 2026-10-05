@@ -4,6 +4,8 @@ EduPilot is a desktop AI personal assistant for classroom management, attendance
 
 The application has database-backed faculty and student workflows. Microphone speech recognition needs a separately installed Vosk model. Face attendance remains disabled until consented enrollment and identity matching are implemented.
 
+EduPilot is a local-first desktop application, not a web client/server product. Its PySide6 screens call Python feature services directly, and those services validate roles and use parameterized SQLite operations. A REST API, CORS configuration, and cloud object storage are intentionally not part of this single-device architecture. Local file storage is isolated behind a storage service so a server-backed storage provider can be added if multi-device deployment becomes a real requirement.
+
 ---
 
 ## 🚀 Quick Start for Team Members
@@ -89,9 +91,35 @@ All dependencies are defined in `requirements.txt`:
 * **`sounddevice`**: Optional local microphone capture for offline Vosk transcription.
 * **`pypdf`**: Optional text extraction from course PDFs.
 * **`psutil`**: Optional live workstation monitoring.
-* **`qrcode[pil]`**: Optional QR image rendering; signed text check-ins work without it.
+* **`qrcode[pil]`**: Scannable signed QR attendance tokens.
 * **`openpyxl`**: Excel exports for attendance and student transcripts.
 * **`tqdm`**, **`colorama`**: CLI utility formatting & progress indicators.
+
+### Data and file storage
+
+Structured data is stored in SQLite. Uploaded course documents and assignment attachments are copied into a private, per-user application data folder; the database stores file keys and metadata rather than file contents. Uploads are limited to 25 MB and an extension allowlist. Existing databases in the older project `database/edupilot.db` location are copied to the new user data location on first launch, preserving their contents.
+
+Default data locations:
+
+| System | Application data folder |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\EduPilot` |
+| macOS | `~/Library/Application Support/EduPilot` |
+| Linux | `$XDG_DATA_HOME/edupilot` or `~/.local/share/edupilot` |
+
+Optional environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `EDUPILOT_DATA_DIR` | Override the per-user data folder (database and default file folder) |
+| `EDUPILOT_DB_PATH` | Use a specific SQLite database file |
+| `EDUPILOT_FILES_DIR` | Store uploaded files in a separate local folder |
+
+There are no required secrets or cloud credentials. Back up the SQLite file and its sibling `files` folder together. A cloud/S3-compatible provider is appropriate only if a future deployment needs shared, multi-device access; signed URLs and remote storage are not implemented in this offline desktop build.
+
+### Run core workflow checks
+
+From the project folder, run `python -m unittest discover -s tests -v`. These tests cover database initialization and legacy database migration, hashed login, QR attendance, course-document retrieval, and managed assignment attachments. They use temporary databases and files.
 
 ### Optional offline speech input
 

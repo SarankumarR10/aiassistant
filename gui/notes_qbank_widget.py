@@ -16,6 +16,7 @@ from database.database import (
 )
 from ai.rag_engine import rag_engine
 from gui.theme import POSITIVUS_QSS, create_section_header
+from storage.local_storage import storage_service
 
 class NotesAndQuestionBankWidget(QWidget):
     """
@@ -262,17 +263,18 @@ class NotesAndQuestionBankWidget(QWidget):
             self.table_notes.setItem(row, 1, QTableWidgetItem(f"{n[1]} - {n[2]}"))
             self.table_notes.setItem(row, 2, QTableWidgetItem(f"Unit {n[3]}"))
             self.table_notes.setItem(row, 3, QTableWidgetItem(str(n[4])))
-            self.table_notes.setItem(row, 4, QTableWidgetItem(str(n[5])))
+            self.table_notes.setItem(row, 4, QTableWidgetItem(storage_service.file_name(n[5])))
 
     def _preview_selected_note(self):
         row = self.table_notes.currentRow()
         if row < 0 or row >= len(getattr(self, "current_notes", [])):
             return
         note = self.current_notes[row]
-        title, path = note[4], note[5]
+        title, reference = note[4], note[5]
         try:
+            path = storage_service.resolve(reference)
             if not os.path.isfile(path):
-                raise FileNotFoundError(f"The source file is not available at: {path}")
+                raise FileNotFoundError("The original course file is no longer available.")
             if os.path.splitext(path)[1].lower() == ".pdf":
                 from pypdf import PdfReader
                 content = "\n\n".join(page.extract_text() or "" for page in PdfReader(path).pages)

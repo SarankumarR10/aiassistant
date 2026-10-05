@@ -26,3 +26,7 @@ tmp/
 # Generated presentation renders and local review deck exports
 .presentation-build/
 deliverables/
+
+# Obsolete local prototype screens are not part of the supported application.
+/gui/dashboard.py
+/gui/dialogs.py
