@@ -8,7 +8,6 @@ from PySide6.QtCore import Qt, QTime, QTimer
 from gui.attendance import AttendanceWindow
 from gui.analytics_widget import ClassroomAnalyticsWidget
 from gui.academics_widget import AcademicTrackerWidget
-from gui.code_runner_widget import CodeRunnerWidget
 from gui.lab_monitor_widget import LabMonitorWidget
 from gui.lab_exam_widget import FacultyLabExamWidget
 from gui.lab_review_widget import LabSubmissionReviewWidget
@@ -319,13 +318,12 @@ class FacultyDashboard(QMainWindow):
             ("Knowledge Base and Notes", 6),
             ("Notices and Reminders", 7),
             ("Lab Workstation", 8),
-            ("Code Runner", 9),
-            ("AI Tutor / Local RAG", 10),
-            ("Schedule / Timetable", 11),
-            ("Voice Assistant", 12),
-            ("Voice Notes", 13),
-            ("Practical Exam Management", 14),
-            ("Lab Submission Review", 15),
+            ("AI Tutor / Local RAG", 9),
+            ("Schedule / Timetable", 10),
+            ("Voice Assistant", 11),
+            ("Voice Notes", 12),
+            ("Practical Exam Management", 13),
+            ("Lab Submission Review", 14),
         ]
 
         self.nav_buttons = []
@@ -362,7 +360,6 @@ class FacultyDashboard(QMainWindow):
 
         # ---------------- STACKED PAGES ----------------
         self.stack = QStackedWidget()
-        self.code_runner_widget = CodeRunnerWidget()
 
         pages = (
             self._build_overview_page(), self._build_attendance_page(),
@@ -371,7 +368,7 @@ class FacultyDashboard(QMainWindow):
             AssignmentsWidget(self.user, role="faculty"),
             NotesAndQuestionBankWidget(self.user, role="faculty"),
             NoticesAndRemindersWidget(self.user, role="faculty"),
-            LabMonitorWidget(), self.code_runner_widget, self._build_ai_rag_page(),
+            LabMonitorWidget(), self._build_ai_rag_page(),
             self._build_timetable_page(), self._build_voice_page(),
             VoiceNotesWidget(self.user), FacultyLabExamWidget(self.user[0]),
             LabSubmissionReviewWidget(self.user[0]),
@@ -820,6 +817,7 @@ class FacultyDashboard(QMainWindow):
         layout.addLayout(microphone_row)
         self.speech_worker = None
         self.speech_error = ""
+        self.last_spoken_phrase = ""
         timer_controls = QHBoxLayout()
         self.voice_timer_label = QLabel("No active timer")
         self.voice_timer_label.setStyleSheet("color: #687782; font-weight: 600;")
@@ -876,21 +874,8 @@ class FacultyDashboard(QMainWindow):
             res = intent["reply"]
         elif intent.get("intent") == "start_timer":
             res = intent.get("reply", "The timer could not be started.")
-        elif intent.get("intent") in {"run_python", "compile_java"}:
-            language = "Python" if intent["intent"] == "run_python" else "Java"
-            self.code_runner_widget.lang_combo.setCurrentText(language)
-            self.switch_page(9)
-            self.code_runner_widget.output_edit.setPlainText(
-                f"{language} sample loaded. No code has been run. Review the source and choose Run Code to confirm isolated execution."
-            )
-            res = (f"{language} code runner opened with a sample program. Review the code and choose Run Code "
-                   "to confirm isolated execution.")
-        elif intent.get("intent") == "create_project":
-            self.switch_page(9)
-            self.code_runner_widget.output_edit.setPlainText(
-                "No project has been created. Choose New Project to set its name, language, and parent folder."
-            )
-            res = "Code Runner opened. Choose New Project and confirm the destination to create starter files."
+        elif intent.get("intent") in {"run_python", "compile_java", "create_project"}:
+            res = "Code Runner is available from the student workspace only."
         else:
             res = execute_voice_intent(intent, user_id=self.user[0], role="faculty")
         self.voice_log.append(f"> {text}\n[Assistant]: {res}\n")
@@ -904,18 +889,28 @@ class FacultyDashboard(QMainWindow):
             self.speech_status_label.setText(explanation)
             return
         self.speech_error = ""
+        self.last_spoken_phrase = ""
         self.speech_status_label.setText("Listening offline… say a command, then pause.")
         self.speech_start_button.setEnabled(False)
         self.speech_stop_button.setEnabled(True)
-        self.speech_worker = SpeechInputWorker(self)
+        self.speech_worker = SpeechInputWorker(self, command_mode=True)
         self.speech_worker.phrase_recognized.connect(self._process_spoken_command)
         self.speech_worker.failed.connect(self._speech_input_failed)
         self.speech_worker.finished.connect(self._speech_input_finished)
         self.speech_worker.start()
 
     def _process_spoken_command(self, phrase: str):
+        self.last_spoken_phrase = phrase
         self.voice_cmd_input.setText(phrase)
-        self._on_voice_cmd()
+        intent = voice_engine.process_command(phrase)
+        if intent.get("intent") == "launch_app" and intent.get("app") == "VS Code":
+            self.speech_status_label.setText("Recognized VS Code. Confirm the launch in the dialog.")
+            self.last_spoken_phrase = ""
+            self._on_voice_cmd()
+            return
+        self.speech_status_label.setText("Heard: “" + phrase + "”. Edit it if needed, then select Execute Command.")
+        if self.speech_worker:
+            self.speech_worker.request_stop()
 
     def _speech_input_failed(self, message: str):
         self.speech_error = message
@@ -924,7 +919,10 @@ class FacultyDashboard(QMainWindow):
         ready, explanation = speech_input_status()
         self.speech_start_button.setEnabled(ready)
         self.speech_stop_button.setEnabled(False)
-        self.speech_status_label.setText(self.speech_error or ("Microphone stopped." if ready else explanation))
+        if self.last_spoken_phrase and not self.speech_error:
+            self.speech_status_label.setText("Review the recognized text and select Execute Command.")
+        else:
+            self.speech_status_label.setText(self.speech_error or ("Microphone stopped." if ready else explanation))
 
     def _stop_speech_input(self):
         if self.speech_worker and self.speech_worker.isRunning():

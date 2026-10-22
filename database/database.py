@@ -34,6 +34,10 @@ def get_app_data_dir() -> Path:
 APP_DATA_DIR = get_app_data_dir()
 LEGACY_DB_PATH = BASE_DIR / "edupilot.db"
 DB_PATH = Path(os.environ.get("EDUPILOT_DB_PATH", APP_DATA_DIR / "edupilot.db")).expanduser()
+_POSTGRES_URL_FILE = APP_DATA_DIR / "postgres_url.txt"
+POSTGRES_URL = os.environ.get("EDUPILOT_DATABASE_URL", "").strip()
+if not POSTGRES_URL and _POSTGRES_URL_FILE.is_file():
+    POSTGRES_URL = _POSTGRES_URL_FILE.read_text(encoding="utf-8").strip()
 _PASSWORD_ITERATIONS = 240_000
 
 
@@ -67,6 +71,22 @@ def _audit(cursor, user_id: int | None, action: str, details: str = "") -> None:
 
 
 def get_connection():
+    if POSTGRES_URL:
+        try:
+            import psycopg
+            from database.postgres_compat import PostgresConnection
+        except ImportError as error:
+            raise RuntimeError(
+                "PostgreSQL is configured but its driver is missing. Install the project requirements."
+            ) from error
+        try:
+            return PostgresConnection(psycopg.connect(POSTGRES_URL))
+        except Exception as error:
+            raise RuntimeError(
+                "Could not connect to PostgreSQL. Check EDUPILOT_DATABASE_URL, that the server is running, "
+                "and that the database/user exist."
+            ) from error
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     if (not os.environ.get("EDUPILOT_DB_PATH")
             and DB_PATH.resolve() != LEGACY_DB_PATH.resolve()
@@ -84,22 +104,62 @@ def get_connection():
     return connection
 
 
+def get_local_connection():
+    """Open the per-device SQLite store for private, device-local features."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DB_PATH, timeout=10)
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 10000")
+    return connection
+
+
+def initialize_local_database() -> None:
+    """Create local-only tables without putting private data in shared PostgreSQL."""
+    with closing(get_local_connection()) as connection:
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS local_settings (
+                name TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS voice_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_voice_notes_owner_updated
+                ON voice_notes(user_id, updated_at DESC);
+        """)
+        connection.commit()
+
+
 def _ensure_column(cursor, table: str, column: str, declaration: str) -> None:
     """Apply an additive SQLite schema migration only when the column is missing."""
-    present = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
+    if POSTGRES_URL:
+        present = {
+            row[0] for row in cursor.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = ?",
+                (table,),
+            ).fetchall()
+        }
+    else:
+        present = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
     if column not in present:
         cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
 def get_or_create_app_secret(name: str) -> str:
-    conn = get_connection()
-    conn.execute("CREATE TABLE IF NOT EXISTS app_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    row = conn.execute("SELECT value FROM app_settings WHERE name = ?", (name,)).fetchone()
+    conn = get_local_connection()
+    conn.execute("CREATE TABLE IF NOT EXISTS local_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    row = conn.execute("SELECT value FROM local_settings WHERE name = ?", (name,)).fetchone()
     if row:
         conn.close()
         return row[0]
     value = secrets.token_hex(32)
-    conn.execute("INSERT INTO app_settings (name, value) VALUES (?, ?)", (name, value))
+    conn.execute("INSERT INTO local_settings (name, value) VALUES (?, ?)", (name, value))
     conn.commit()
     conn.close()
     return value
@@ -158,24 +218,6 @@ def initialize_database():
                 ON DELETE CASCADE
         )
     """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS lab_exam_submissions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            exam_id INTEGER NOT NULL,
-            student_id INTEGER NOT NULL,
-            solution_code TEXT NOT NULL DEFAULT '',
-            started_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            expires_at INTEGER,
-            submitted_at TEXT,
-            UNIQUE(exam_id, student_id),
-            FOREIGN KEY(exam_id) REFERENCES lab_exams(id) ON DELETE CASCADE,
-            FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE
-        )
-    """)
-    for column, declaration in (("started_at", "TEXT"), ("expires_at", "INTEGER")):
-        _ensure_column(cursor, "lab_exam_submissions", column, declaration)
-    cursor.execute("UPDATE lab_exam_submissions SET started_at = COALESCE(started_at, submitted_at, CURRENT_TIMESTAMP)")
 
     # --------------------------------------------------------
     # SUBJECTS
@@ -532,6 +574,26 @@ def initialize_database():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS lab_exam_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exam_id INTEGER NOT NULL,
+            student_id INTEGER NOT NULL,
+            solution_code TEXT NOT NULL DEFAULT '',
+            draft_code TEXT NOT NULL DEFAULT '',
+            started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            expires_at INTEGER,
+            submitted_at TEXT,
+            UNIQUE(exam_id, student_id),
+            FOREIGN KEY(exam_id) REFERENCES lab_exams(id) ON DELETE CASCADE,
+            FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE
+        )
+    """)
+    for column, declaration in (("draft_code", "TEXT NOT NULL DEFAULT ''"),
+                                ("started_at", "TEXT"), ("expires_at", "INTEGER")):
+        _ensure_column(cursor, "lab_exam_submissions", column, declaration)
+    cursor.execute("UPDATE lab_exam_submissions SET started_at = COALESCE(started_at, submitted_at, CURRENT_TIMESTAMP)")
+
     # --------------------------------------------------------
     # REMINDERS & ANNOUNCEMENTS & FAQ
     # --------------------------------------------------------
@@ -570,19 +632,12 @@ def initialize_database():
         )
     """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS voice_notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_voice_notes_owner_updated ON voice_notes(user_id, updated_at DESC)")
-
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_attendance_sessions_date_subject ON attendance_sessions(class_date, subject_id, section)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignments_due_date ON assignments(due_date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignment_submissions_assignment_date ON assignment_submissions(assignment_id, submitted_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_document ON document_chunks(document_id, chunk_index)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_announcements_target_date ON announcements(target_group, created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reminders_owner_due ON reminders(user_id, due_date)")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS assistant_query_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -591,12 +646,6 @@ def initialize_database():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_assistant_query_events_created_at ON assistant_query_events(created_at)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_attendance_sessions_date_subject ON attendance_sessions(class_date, subject_id, section)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignments_due_date ON assignments(due_date)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignment_submissions_assignment_date ON assignment_submissions(assignment_id, submitted_at DESC)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_document ON document_chunks(document_id, chunk_index)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_announcements_target_date ON announcements(target_group, created_at DESC)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reminders_owner_due ON reminders(user_id, due_date)")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS app_settings (
@@ -758,6 +807,7 @@ def initialize_database():
     cursor.execute("PRAGMA user_version = 2")
     connection.commit()
     connection.close()
+    initialize_local_database()
     from storage.local_storage import storage_service
     storage_service.remove_orphaned_files()
 
@@ -1526,7 +1576,8 @@ def get_attendance_analytics(start_date: str | None = None, end_date: str | None
             st.name,
             COUNT(ar.id) as total_sessions,
             SUM(CASE WHEN ar.status = 'Present' THEN 1 ELSE 0 END) as present_count,
-            ROUND(CAST(SUM(CASE WHEN ar.status = 'Present' THEN 1 ELSE 0 END) AS FLOAT) / MAX(1, COUNT(ar.id)) * 100, 1) as percentage
+            ROUND(CAST(SUM(CASE WHEN ar.status = 'Present' THEN 1 ELSE 0 END) AS NUMERIC) /
+                  CASE WHEN COUNT(ar.id) < 1 THEN 1 ELSE COUNT(ar.id) END * 100, 1) as percentage
         FROM students st
         LEFT JOIN attendance_records ar ON ar.student_id = st.id
     """ + scoped_sessions + """
@@ -1540,11 +1591,11 @@ def get_attendance_analytics(start_date: str | None = None, end_date: str | None
 
 def get_voice_notes(user_id: int) -> list[tuple]:
     """Return the current user's private notes, most recently updated first."""
-    with closing(get_connection()) as conn:
-        role = conn.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
+    with closing(get_connection()) as shared, closing(get_local_connection()) as local:
+        role = shared.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
         if not role:
             raise PermissionError("Sign in to view your private notes.")
-        return conn.execute(
+        return local.execute(
             "SELECT id, title, content, created_at, updated_at FROM voice_notes "
             "WHERE user_id = ? ORDER BY updated_at DESC, id DESC",
             (user_id,),
@@ -1563,16 +1614,16 @@ def save_voice_note(user_id: int, title: str, content: str, note_id: int | None 
         raise ValueError("Enter some note text before saving.")
     if len(content) > 100_000:
         raise ValueError("Notes are limited to 100,000 characters.")
-    with closing(get_connection()) as conn:
-        role = conn.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
+    with closing(get_connection()) as shared:
+        role = shared.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
         if not role:
             raise PermissionError("Sign in to save private notes.")
+    with closing(get_local_connection()) as conn:
         if note_id is None:
             cursor = conn.execute(
                 "INSERT INTO voice_notes (user_id, title, content) VALUES (?, ?, ?)",
                 (user_id, title, content),
             )
-            _audit(conn.cursor(), user_id, "voice_note.created", f"note={cursor.lastrowid}; title={title}")
             conn.commit()
             return cursor.lastrowid
         cursor = conn.execute(
@@ -1582,18 +1633,16 @@ def save_voice_note(user_id: int, title: str, content: str, note_id: int | None 
         )
         if cursor.rowcount != 1:
             raise PermissionError("That note does not belong to your account or no longer exists.")
-        _audit(conn.cursor(), user_id, "voice_note.updated", f"note={note_id}; title={title}")
         conn.commit()
         return note_id
 
 
 def delete_voice_note(user_id: int, note_id: int) -> None:
     """Delete one of the current user's private notes and log the action."""
-    with closing(get_connection()) as conn:
+    with closing(get_local_connection()) as conn:
         cursor = conn.execute("DELETE FROM voice_notes WHERE id = ? AND user_id = ?", (note_id, user_id))
         if cursor.rowcount != 1:
             raise PermissionError("That note does not belong to your account or no longer exists.")
-        _audit(conn.cursor(), user_id, "voice_note.deleted", f"note={note_id}")
         conn.commit()
     return rows
 
@@ -1630,7 +1679,7 @@ def get_classroom_activity_stats(faculty_id: int) -> dict:
                 "SELECT COUNT(*) FROM lab_submissions WHERE date(completed_at, 'localtime') = date('now', 'localtime')"
             ).fetchone()[0],
             "attendance_sessions_today": conn.execute(
-                "SELECT COUNT(*) FROM attendance_sessions WHERE class_date = date('now', 'localtime')"
+                "SELECT COUNT(*) FROM attendance_sessions WHERE class_date = CAST(date('now', 'localtime') AS TEXT)"
             ).fetchone()[0],
             "assignment_submissions_today": conn.execute(
                 "SELECT COUNT(*) FROM assignment_submissions WHERE date(submitted_at, 'localtime') = date('now', 'localtime')"

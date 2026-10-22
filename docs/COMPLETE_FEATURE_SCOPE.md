@@ -8,13 +8,14 @@ The application now includes persistent role-based attendance, student academic 
 
 - The supported architecture is a local-first PySide6 desktop application. Screens call Python feature services directly; those services enforce role checks and use parameterized SQLite queries. There is no REST server, web client, CORS policy, or remote identity provider in this project.
 - Structured records live in per-user SQLite storage. Course documents and assignment attachments are copied into a managed local file directory, while the database stores opaque file keys and metadata. `EDUPILOT_DATA_DIR`, `EDUPILOT_DB_PATH`, and `EDUPILOT_FILES_DIR` can relocate data. Legacy project-folder databases are copied using SQLite's backup API on first launch.
+- There is no cross-device synchronization. Each installation has its own local database and file store; copying the project folder or signing in on another computer does not sync records.
 - The managed local storage service enforces a 25 MB upload ceiling, an extension allowlist, random file names, and path containment checks. Cloud/S3 storage, signed URLs, and shared multi-device file access are not implemented; a remote provider is only recommended if the product changes to a client/server deployment.
 
 - Voice commands can be entered as text or captured from the microphone with a configured local Vosk model and `sounddevice`. The model is not bundled; text-to-speech remains optional.
 - Face attendance is disabled because face detection alone cannot identify a student. QR check-in uses signed, section-bound five-minute codes; students can scan locally with OpenCV or paste the token, then explicitly submit it for validation.
-- The code runner requires the optional `edupilot-runner` Docker image. It uses no network, read-only base filesystem, a temporary workspace, memory/process limits, timeout, and explicit confirmation; it does not execute code directly on the host.
-- Practical exam submissions and start/deadline times are saved locally and enforced on submission. Faculty can publish and close active practical exams. Screen locking remains disabled.
-- Workstation metrics require `psutil`; PDF indexing requires `pypdf`; scannable QR rendering requires `qrcode`; Excel exports require `openpyxl`. Missing optional runtime dependencies are reported instead of replaced with sample data.
+- The student code runner requires the optional `edupilot-runner` Docker image. It uses no network, read-only base filesystem, a temporary workspace, memory/process limits, timeout, and explicit confirmation; faculty do not have a code runner page.
+- Practical exam attempts and deadlines are stored in PostgreSQL and enforced on submission. Student exams use fullscreen mode, autosaved private drafts, automatic submission at timeout, and app-level navigation/close restrictions. Faculty can publish and close active practical exams. This desktop app does not lock down Windows or prevent OS-level task switching.
+- The core installer includes `psutil`, `pypdf`, `qrcode`, and `openpyxl` for workstation metrics, PDF indexing, QR rendering, and spreadsheet exports. Microphone recognition, TTS, and camera tools are optional and listed in `requirements-optional.txt`.
 - Analytics and reports are based on recorded data. Empty data is shown as unavailable rather than as a fabricated percentage.
 - Setup scripts check Python 3.10+ and detect a broken generated virtual environment; the run scripts report how to rebuild it.
 - The offline tutor includes 23 curated starter FAQs across programming and core computer-science subjects. Faculty can extend the local knowledge base with approved notes and questions.
@@ -46,10 +47,10 @@ The application now includes persistent role-based attendance, student academic 
 | Feature | Planned behaviour | Status |
 |---|---|---|
 | Smart Classroom Control | Voice/text commands for PowerPoint, slides, lecture notes, timer, schedule, and optional LMS access | Typed command console supports confirmed allowlisted app launches, slide controls, countdown timers, schedules, notices, reminders, and local course queries; lecture-note/LMS controls remain unavailable |
-| Smart Lab Assistant | Open VS Code, IntelliJ, Eclipse, Chrome, SQL Developer, Android Studio, Git Bash; create projects and run tools | Confirmed allowlisted app launches, guarded local starter-project creation, and isolated Code Runner; each optional local tool must be installed |
+| Smart Lab Assistant | Open VS Code, IntelliJ, Eclipse, Chrome, SQL Developer, Android Studio, Git Bash; create projects and run tools | Faculty voice console supports confirmed allowlisted app launches; student Code Runner is restricted and requires Docker; each optional local tool must be installed |
 | Smart Lab Monitoring | CPU, RAM, disk, network, and running-application status | Live CPU, RAM, disk, network counters, and process data when `psutil` is installed |
 | AI Lab Assistant | Compile code, explain errors, guide practical work | Code runner and error explanation phase |
-| Code Runner | Run Java, Python, C, and C++ through the GUI/voice command | Voice commands open the matching editor; the user reviews the sample and confirms before restricted Docker execution (no network, resource limits, and timeout); Docker image setup is required |
+| Code Runner | Run Java, Python, C, and C++ through the student GUI | Available in the student workspace; the user reviews the sample and confirms before restricted Docker execution (no network, resource limits, and timeout); Docker image setup is required |
 | Lab Exam Assistant | Question paper, timer, submission, optional screen lock | Faculty publish/close workflow, active question display, persisted per-student timer/submission; screen lock is not implemented |
 
 ## Track D — Faculty and student experience
@@ -75,4 +76,4 @@ The application now includes persistent role-based attendance, student academic 
 - Offline microphone input requires `sounddevice` and a separately supplied Vosk model. Guided roll call, note dictation, and QR camera scanning require local microphone/camera access; typed notes, typed attendance phrases, and pasted signed QR codes remain available as fallbacks.
 - The restricted code runner requires Docker and the documented `edupilot-runner` image.
 - Face identity matching, screen locking, and LMS access are not enabled. They need hardware/service integration or additional privacy safeguards and are not represented as completed features.
-- Live workstation metrics require `psutil`; PDF extraction requires `pypdf`; Excel exports require `openpyxl`; QR image rendering requires `qrcode`.
+- The standard requirements install includes workstation metrics (`psutil`), PDF extraction (`pypdf`), Excel exports (`openpyxl`), and QR image rendering (`qrcode`). Optional speech and camera dependencies are listed separately.

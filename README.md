@@ -1,16 +1,16 @@
 # EduPilot - Classroom & Laboratory Assistant
 
-EduPilot is a desktop AI personal assistant for classroom management, attendance tracking, laboratory monitoring, code execution, student progress analytics, and voice-assisted studying built with **PySide6 (Qt for Python)** and **SQLite**.
+EduPilot is an offline-first desktop application for faculty and students. It includes attendance, assignments, student records, local course-material search, and lab workflows. The student workspace includes a restricted code runner; faculty no longer see that tool. The app uses **PySide6 (Qt for Python)** and **SQLite**.
 
 The application has database-backed faculty and student workflows. Microphone speech recognition needs a separately installed Vosk model. Face attendance remains disabled until consented enrollment and identity matching are implemented.
 
-EduPilot is a local-first desktop application, not a web client/server product. Its PySide6 screens call Python feature services directly, and those services validate roles and use parameterized SQLite operations. A REST API, CORS configuration, and cloud object storage are intentionally not part of this single-device architecture. Local file storage is isolated behind a storage service so a server-backed storage provider can be added if multi-device deployment becomes a real requirement.
+EduPilot uses a split data store. PostgreSQL holds shared academic records and accounts when configured; SQLite keeps private device-only data such as voice notes and local application secrets. Without PostgreSQL configured, the app uses SQLite for the whole database. PostgreSQL access is currently a direct connection for a controlled classroom/demo network; do not expose it to the public internet. A production product should put an authenticated API between desktop clients and PostgreSQL. Uploaded files remain local to the device, and offline AI/course-material search stays on the device.
 
 ---
 
 ## 🚀 Quick Start for Team Members
 
-You can set up and start the project in **one click** on Windows, macOS, or Linux.
+Install Python 3.10 or newer, then set up and start the project. Run these scripts from the `aiassistant` folder.
 
 ### Option 1: One-Click Automated Setup (Recommended)
 
@@ -55,15 +55,40 @@ pip install -r requirements.txt
 python main.py
 ```
 
-### Isolated code runner (optional)
+### Optional offline speech features
 
-Install Docker Desktop or Docker Engine with Linux containers enabled, then build the restricted execution image from the project root:
+The microphone requires the optional packages and a separately downloaded Vosk English model. From the `aiassistant` folder, run `pip install -r requirements-optional.txt`, then place the extracted model in `models/vosk-model-small-en-us-0.15`. Text commands and the rest of the app do not require this setup.
+
+### Optional student code runner
+
+The student code runner needs Docker Desktop or Docker Engine with Linux containers enabled. Build its restricted execution image from the project root:
 
 ```bash
 docker build -f docker/Dockerfile.runner -t edupilot-runner:latest docker
 ```
 
 The runner has no network, a read-only base filesystem, a temporary per-run workspace, a 256 MB memory cap, process limit, and execution timeout. If Docker or the image is unavailable, EduPilot reports that code was not run. Do not switch this feature to direct host execution for untrusted programs.
+
+Practical exams open in fullscreen after the student confirms. The app keeps the exam timer running, autosaves a private draft, submits the last answer when time expires, and prevents normal in-app navigation or closing until submission or timeout. This is an app-level exam mode; Windows shortcuts and administrator tools can still switch away or stop the app, so it is not a managed-device kiosk or remote proctoring system.
+
+### Connect to PostgreSQL
+
+Install PostgreSQL, start the server, then run the setup wizard from the project folder:
+
+```powershell
+python setup_postgres.py
+```
+
+Enter the PostgreSQL `postgres` administrator password when prompted. The wizard creates the `edupilot` database and a limited app login, then saves its connection in the user's EduPilot application-data folder. It does not put credentials in project files. Start the app normally with `run.bat` or `./run.sh`.
+
+Alternatively, set `EDUPILOT_DATABASE_URL` before starting the app to override that saved connection. For example, on Windows PowerShell:
+
+```powershell
+$env:EDUPILOT_DATABASE_URL = "postgresql://user:password@localhost:5432/edupilot"
+python main.py
+```
+
+The app creates its shared tables and demo accounts in PostgreSQL at startup. Personal voice notes and local app secrets stay in SQLite on each device. To run fully from SQLite, remove the saved connection file from the EduPilot application-data folder and unset `EDUPILOT_DATABASE_URL`. PostgreSQL mode is currently for a trusted LAN/demo; remote multi-device deployment needs an API service, TLS, and shared file storage.
 
 ---
 
@@ -82,22 +107,11 @@ The project comes pre-seeded with test accounts for Faculty and Student roles:
 
 ## 📦 Installed Packages & Dependencies
 
-All dependencies are defined in `requirements.txt`:
-* **`PySide6`**: Modern Qt UI desktop framework.
-* **`opencv-python`**: Optional face detection only; detection is not identity verification.
-* **`numpy`**: Image processing & array mathematics.
-* **`pyttsx3`**: Offline Text-to-Speech (TTS) engine.
-* **`vosk`**: Speech recognition library; a local Vosk model is not bundled.
-* **`sounddevice`**: Optional local microphone capture for offline Vosk transcription.
-* **`pypdf`**: Optional text extraction from course PDFs.
-* **`psutil`**: Optional live workstation monitoring.
-* **`qrcode[pil]`**: Scannable signed QR attendance tokens.
-* **`openpyxl`**: Excel exports for attendance and student transcripts.
-* **`tqdm`**, **`colorama`**: CLI utility formatting & progress indicators.
+`requirements.txt` installs the core desktop app and its supported features: PySide6, QR image creation, Excel exports, PDF text extraction, and workstation metrics. `requirements-optional.txt` is only for local speech recognition, speech output, and camera-based tools. The Vosk model and Docker runner image are separate downloads; neither is bundled with the source.
 
 ### Data and file storage
 
-Structured data is stored in SQLite. Uploaded course documents and assignment attachments are copied into a private, per-user application data folder; the database stores file keys and metadata rather than file contents. Uploads are limited to 25 MB and an extension allowlist. Existing databases in the older project `database/edupilot.db` location are copied to the new user data location on first launch, preserving their contents.
+Shared academic records are stored in PostgreSQL when configured. Private voice notes and local application secrets are stored in the per-device SQLite file. Uploaded course documents and assignment attachments are copied into a private, per-user application data folder; the database stores file keys and metadata rather than file contents. Uploads are limited to 25 MB and an extension allowlist. Existing SQLite databases in the older project `database/edupilot.db` location are copied to the new user data location on first launch, preserving their contents.
 
 Default data locations:
 
@@ -113,6 +127,7 @@ Optional environment variables:
 | --- | --- |
 | `EDUPILOT_DATA_DIR` | Override the per-user data folder (database and default file folder) |
 | `EDUPILOT_DB_PATH` | Use a specific SQLite database file |
+| `EDUPILOT_DATABASE_URL` | Configure PostgreSQL for shared academic records |
 | `EDUPILOT_FILES_DIR` | Store uploaded files in a separate local folder |
 
 There are no required secrets or cloud credentials. Back up the SQLite file and its sibling `files` folder together. A cloud/S3-compatible provider is appropriate only if a future deployment needs shared, multi-device access; signed URLs and remote storage are not implemented in this offline desktop build.

@@ -1,4 +1,4 @@
-"""Persistent, timed practical exam sessions for local student accounts."""
+"""Persistent, timed practical exam sessions for EduPilot student accounts."""
 import time
 
 from database.database import get_lab_exams, get_connection, _audit
@@ -42,16 +42,79 @@ class LabExamAssistant:
         finally:
             conn.close()
 
+    def get_draft(self, exam_id: int, user_id: int) -> str:
+        """Load only this student's saved draft for the current exam attempt."""
+        conn = get_connection()
+        try:
+            row = conn.execute("""SELECT sub.draft_code
+                FROM lab_exam_submissions sub
+                JOIN students st ON st.id = sub.student_id
+                JOIN users u ON u.id = st.user_id
+                JOIN lab_exams e ON e.id = sub.exam_id
+                WHERE sub.exam_id = ? AND st.user_id = ? AND u.role = 'student'
+                  AND sub.submitted_at IS NULL AND sub.expires_at > ? AND e.is_active = 1""",
+                (exam_id, user_id, int(time.time()))).fetchone()
+            if row is None:
+                raise ValueError("This exam attempt is no longer active.")
+            return row[0] or ""
+        finally:
+            conn.close()
+
+    def save_draft(self, exam_id: int, user_id: int, draft_code: str) -> None:
+        """Autosave a student's draft without exposing it as a faculty submission."""
+        if len(draft_code) > 100_000:
+            raise ValueError("Exam answers are limited to 100,000 characters.")
+        conn = get_connection()
+        try:
+            cursor = conn.execute("""UPDATE lab_exam_submissions
+                SET draft_code = ?
+                WHERE exam_id = ? AND student_id = (
+                    SELECT id FROM students WHERE user_id = ?
+                ) AND submitted_at IS NULL AND expires_at > ?
+                  AND EXISTS (SELECT 1 FROM lab_exams WHERE id = ? AND is_active = 1)""",
+                (draft_code, exam_id, user_id, int(time.time()), exam_id))
+            if cursor.rowcount != 1:
+                raise ValueError("The exam time expired or this exam is no longer active.")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def submit_expired_exam(self, exam_id: int, user_id: int, solution_code: str) -> bool:
+        """Finalize the last answer at the deadline, even if autosave was still pending."""
+        if len(solution_code) > 100_000:
+            raise ValueError("Exam answers are limited to 100,000 characters.")
+        conn = get_connection()
+        try:
+            cursor = conn.execute("""UPDATE lab_exam_submissions
+                SET solution_code = ?, draft_code = '', submitted_at = CURRENT_TIMESTAMP
+                WHERE exam_id = ? AND student_id = (
+                    SELECT id FROM students WHERE user_id = ?
+                ) AND submitted_at IS NULL AND expires_at <= ?""",
+                (solution_code, exam_id, user_id, int(time.time())))
+            conn.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def submit_exam(self, exam_id: int, user_id: int, solution_code: str) -> bool:
         if not solution_code.strip():
             raise ValueError("Exam submission cannot be empty.")
+        if len(solution_code) > 100_000:
+            raise ValueError("Exam answers are limited to 100,000 characters.")
         conn = get_connection()
         try:
             student = conn.execute("SELECT st.id FROM students st JOIN users u ON u.id = st.user_id WHERE st.user_id = ? AND u.role = 'student'", (user_id,)).fetchone()
             if not student:
                 raise PermissionError("A student account is required to submit an exam.")
             student_id = student[0]
-            cursor = conn.execute("""UPDATE lab_exam_submissions SET solution_code = ?, submitted_at = CURRENT_TIMESTAMP
+            cursor = conn.execute("""UPDATE lab_exam_submissions
+                SET solution_code = ?, draft_code = '', submitted_at = CURRENT_TIMESTAMP
                 WHERE exam_id = ? AND student_id = ? AND submitted_at IS NULL AND expires_at > ?
                 AND EXISTS (SELECT 1 FROM lab_exams WHERE id = ? AND is_active = 1)""",
                 (solution_code, exam_id, student_id, int(time.time()), exam_id))

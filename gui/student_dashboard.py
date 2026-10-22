@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QListWidget, QFileDialog, QScrollArea, QTableWidget,
     QTableWidgetItem, QHeaderView
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
 from gui.student_attendance import StudentAttendanceWindow
 from gui.academics_widget import AcademicTrackerWidget
 from gui.code_runner_widget import CodeRunnerWidget
@@ -27,11 +27,13 @@ from voice.speech_input import speech_input_status
 
 
 class StudentDashboard(QMainWindow):
+    LAB_EXAM_PAGE_INDEX = 10
 
     def __init__(self, user, logout_callback):
         super().__init__()
         self.user = user
         self.logout_callback = logout_callback
+        self._exam_active = False
 
         self.setWindowTitle("EduPilot Workspace - Student Portal")
         self.setMinimumSize(1024, 680)
@@ -51,6 +53,7 @@ class StudentDashboard(QMainWindow):
 
         # ---------------- LIGHT NEUTRAL SIDEBAR ----------------
         sidebar = QFrame()
+        self.sidebar = sidebar
         sidebar.setObjectName("appSidebar")
         sidebar.setFixedWidth(252)
         sidebar.setStyleSheet("""
@@ -587,6 +590,8 @@ class StudentDashboard(QMainWindow):
 
         self.exam_solution = QTextEdit()
         self.exam_solution.setEnabled(False)
+        self.exam_solution.setMaximumHeight(460)
+        self.exam_solution.installEventFilter(self)
         self.exam_solution.setStyleSheet("""
             QTextEdit {
                 background-color: #FFFFFF;
@@ -599,6 +604,10 @@ class StudentDashboard(QMainWindow):
         """)
         layout.addWidget(self.exam_solution)
 
+        self.exam_save_status = QLabel("Your draft is saved automatically while the exam is active.")
+        self.exam_save_status.setStyleSheet("color: #687782; font-size: 12px;")
+        layout.addWidget(self.exam_save_status)
+
         sub_btn = QPushButton("Submit Exam Solution")
         sub_btn.setCursor(Qt.PointingHandCursor)
         sub_btn.setProperty("class", "secondary")
@@ -607,31 +616,105 @@ class StudentDashboard(QMainWindow):
         sub_btn.clicked.connect(self._submit_exam)
         layout.addWidget(sub_btn)
 
+        self.exam_return_button = QPushButton("Return to Student Dashboard")
+        self.exam_return_button.setProperty("class", "outline")
+        self.exam_return_button.setVisible(False)
+        self.exam_return_button.clicked.connect(self._return_from_exam)
+        layout.addWidget(self.exam_return_button)
+
         self.exam_timer = QTimer(self)
         self.exam_timer.timeout.connect(self._update_exam_timer)
         self.exam_seconds_remaining = 0
+        self.exam_draft_timer = QTimer(self)
+        self.exam_draft_timer.setSingleShot(True)
+        self.exam_draft_timer.setInterval(900)
+        self.exam_draft_timer.timeout.connect(self._save_exam_draft)
+        self.exam_solution.textChanged.connect(self._schedule_exam_draft_save)
 
         return page
 
     def _start_lab_exam(self):
+        answer = QMessageBox.question(
+            self,
+            "Start practical exam",
+            "Starting or resuming enters fullscreen mode. The timer cannot be paused, and your work will be saved automatically. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
         try:
             remaining = lab_exam_assistant.start_exam(self.active_exam_data["id"], self.user[0])
+            draft = lab_exam_assistant.get_draft(self.active_exam_data["id"], self.user[0])
+            self.exam_solution.blockSignals(True)
+            self.exam_solution.setPlainText(draft)
+            self.exam_solution.blockSignals(False)
             self.exam_seconds_remaining = remaining
+            self._exam_active = True
             self.exam_solution.setEnabled(True)
             self.exam_submit_button.setEnabled(True)
             self.exam_start_button.setEnabled(False)
+            self.exam_return_button.setVisible(False)
+            self.exam_save_status.setText("Draft saved automatically. Do not close EduPilot before submitting.")
+            self.sidebar.hide()
+            self.stack.setCurrentIndex(self.LAB_EXAM_PAGE_INDEX)
+            self.showFullScreen()
+            self.activateWindow()
+            self.raise_()
+            self.exam_solution.setFocus()
             self.exam_timer.start(1000)
             self._update_exam_timer()
         except Exception as error:
             self.exam_clock_label.setText(str(error))
-            self.exam_start_button.setEnabled(False)
+            self.exam_start_button.setEnabled(True)
+
+    def _schedule_exam_draft_save(self):
+        if self._exam_active:
+            self.exam_save_status.setText("Saving draft…")
+            self.exam_draft_timer.start()
+
+    def _save_exam_draft(self):
+        if not self._exam_active:
+            return
+        try:
+            lab_exam_assistant.save_draft(
+                self.active_exam_data["id"], self.user[0], self.exam_solution.toPlainText()
+            )
+            self.exam_save_status.setText("Draft saved automatically.")
+        except Exception as error:
+            self.exam_save_status.setText(f"Draft could not be saved: {error}")
+
+    def _return_from_exam(self):
+        if self._exam_active:
+            QMessageBox.warning(self, "Exam in progress", "Submit your exam or wait for the timer to expire before returning.")
+            return
+        self.exam_draft_timer.stop()
+        self.sidebar.show()
+        self.stack.setCurrentIndex(0)
+        self.showMaximized()
 
     def _update_exam_timer(self):
         if self.exam_seconds_remaining <= 0:
+            self.exam_draft_timer.stop()
+            try:
+                finalized = lab_exam_assistant.submit_expired_exam(
+                    self.active_exam_data["id"], self.user[0], self.exam_solution.toPlainText()
+                )
+                if not finalized:
+                    # Keep the server deadline authoritative if the desktop timer fires early.
+                    self.exam_seconds_remaining = 1
+                    self.exam_timer.start(1000)
+                    return
+                self.exam_clock_label.setText("Time expired. Your last answer was submitted automatically.")
+                self.exam_save_status.setText("Time expired. Your answer was submitted for faculty review.")
+            except Exception as error:
+                self.exam_clock_label.setText("Time expired. Automatic submission could not be confirmed.")
+                self.exam_save_status.setText(f"Reconnect and contact faculty with this message: {error}")
             self.exam_timer.stop()
-            self.exam_clock_label.setText("Time expired. The solution can no longer be submitted.")
+            self._exam_active = False
             self.exam_solution.setEnabled(False)
             self.exam_submit_button.setEnabled(False)
+            self.exam_return_button.setVisible(True)
             return
         minutes, seconds = divmod(self.exam_seconds_remaining, 60)
         self.exam_clock_label.setText(f"Time remaining: {minutes:02d}:{seconds:02d}")
@@ -668,6 +751,7 @@ class StudentDashboard(QMainWindow):
         layout.addLayout(microphone_row)
         self.speech_worker = None
         self.speech_error = ""
+        self.last_spoken_phrase = ""
         timer_controls = QHBoxLayout()
         self.voice_timer_label = QLabel("No active timer")
         self.voice_timer_label.setStyleSheet("color: #687782; font-weight: 600;")
@@ -738,18 +822,28 @@ class StudentDashboard(QMainWindow):
             self.speech_status_label.setText(explanation)
             return
         self.speech_error = ""
+        self.last_spoken_phrase = ""
         self.speech_status_label.setText("Listening offline… say a command, then pause.")
         self.speech_start_button.setEnabled(False)
         self.speech_stop_button.setEnabled(True)
-        self.speech_worker = SpeechInputWorker(self)
+        self.speech_worker = SpeechInputWorker(self, command_mode=True)
         self.speech_worker.phrase_recognized.connect(self._process_spoken_command)
         self.speech_worker.failed.connect(self._speech_input_failed)
         self.speech_worker.finished.connect(self._speech_input_finished)
         self.speech_worker.start()
 
     def _process_spoken_command(self, phrase: str):
+        self.last_spoken_phrase = phrase
         self.voice_command_input.setText(phrase)
-        self._run_student_voice_command()
+        intent = voice_engine.process_command(phrase)
+        if intent.get("intent") == "launch_app" and intent.get("app") == "VS Code":
+            self.speech_status_label.setText("Recognized VS Code. Confirm the launch in the dialog.")
+            self.last_spoken_phrase = ""
+            self._run_student_voice_command()
+            return
+        self.speech_status_label.setText("Heard: “" + phrase + "”. Edit it if needed, then select Process command.")
+        if self.speech_worker:
+            self.speech_worker.request_stop()
 
     def _speech_input_failed(self, message: str):
         self.speech_error = message
@@ -758,7 +852,10 @@ class StudentDashboard(QMainWindow):
         ready, explanation = speech_input_status()
         self.speech_start_button.setEnabled(ready)
         self.speech_stop_button.setEnabled(False)
-        self.speech_status_label.setText(self.speech_error or ("Microphone stopped." if ready else explanation))
+        if self.last_spoken_phrase and not self.speech_error:
+            self.speech_status_label.setText("Review the recognized text and select Process command.")
+        else:
+            self.speech_status_label.setText(self.speech_error or ("Microphone stopped." if ready else explanation))
 
     def _stop_speech_input(self):
         if self.speech_worker and self.speech_worker.isRunning():
@@ -767,10 +864,31 @@ class StudentDashboard(QMainWindow):
             self.speech_worker.request_stop()
 
     def closeEvent(self, event):
+        if self._exam_active:
+            QMessageBox.warning(
+                self,
+                "Exam in progress",
+                "Close is disabled while the exam timer is running. Submit your work or wait for time to expire.",
+            )
+            event.ignore()
+            return
         if self.speech_worker and self.speech_worker.isRunning():
             self.speech_worker.request_stop()
             self.speech_worker.wait()
         super().closeEvent(event)
+
+    def keyPressEvent(self, event):
+        if self._exam_active and event.key() in (Qt.Key_Escape, Qt.Key_F11):
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def eventFilter(self, watched, event):
+        if (self._exam_active and watched is self.exam_solution
+                and event.type() == QEvent.KeyPress
+                and event.key() in (Qt.Key_Escape, Qt.Key_F11)):
+            return True
+        return super().eventFilter(watched, event)
 
     def _tick_voice_timer(self):
         minutes, seconds = divmod(self.voice_seconds_remaining, 60)
@@ -805,10 +923,17 @@ class StudentDashboard(QMainWindow):
             self.exam_solution.setEnabled(False)
             self.exam_submit_button.setEnabled(False)
             self.exam_timer.stop()
+            self.exam_draft_timer.stop()
+            self._exam_active = False
             self.exam_clock_label.setText("Submitted. Faculty evaluation is pending.")
+            self.exam_save_status.setText("Submitted successfully. Faculty evaluation is pending.")
+            self.exam_return_button.setVisible(True)
         except Exception as error:
             QMessageBox.critical(self, "Submission failed", str(error))
 
     def logout(self):
+        if self._exam_active:
+            QMessageBox.warning(self, "Exam in progress", "You cannot sign out while the exam timer is running.")
+            return
         self.close()
         self.logout_callback()

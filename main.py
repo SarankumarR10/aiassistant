@@ -18,7 +18,7 @@ def main():
         QMessageBox.critical(
             None,
             "EduPilot could not start",
-            "EduPilot could not prepare its local database. Check that the application data folder is writable.\n\n"
+            "EduPilot could not prepare its configured database. Check the database connection and permissions.\n\n"
             f"Details: {error}",
         )
         return 1
