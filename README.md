@@ -1,10 +1,10 @@
 # EduPilot - Classroom & Laboratory Assistant
 
-EduPilot is an offline-first desktop application for faculty and students. It includes attendance, assignments, student records, local course-material search, and lab workflows. The student workspace includes a restricted code runner; faculty no longer see that tool. The app uses **PySide6 (Qt for Python)** and **SQLite**.
+EduPilot is a local-first desktop application for faculty and students. It includes attendance, assignments, student records, local course-material search, and lab workflows. The student workspace includes a restricted code runner; faculty no longer see that tool. The app uses **PySide6 (Qt for Python)**, SQLite for device-local data, and optional PostgreSQL for shared academic records.
 
 The application has database-backed faculty and student workflows. Microphone speech recognition needs a separately installed Vosk model. Face attendance remains disabled until consented enrollment and identity matching are implemented.
 
-EduPilot uses a split data store. PostgreSQL holds shared academic records and accounts when configured; SQLite keeps private device-only data such as voice notes and local application secrets. Without PostgreSQL configured, the app uses SQLite for the whole database. PostgreSQL access is currently a direct connection for a controlled classroom/demo network; do not expose it to the public internet. A production product should put an authenticated API between desktop clients and PostgreSQL. Uploaded files remain local to the device, and offline AI/course-material search stays on the device.
+EduPilot uses a split data store. PostgreSQL holds shared academic records and accounts when configured; SQLite keeps private device-only data such as voice notes and local settings. The QR attendance signing key is shared through PostgreSQL when that database is configured, so connected faculty and student devices validate the same QR token. Without PostgreSQL configured, the app uses SQLite for the whole database. PostgreSQL access is currently a direct connection for a controlled classroom/demo network; do not expose it to the public internet. A production product should put an authenticated API between desktop clients and PostgreSQL. Uploaded files remain local to the device, and offline AI/course-material search stays on the device.
 
 ---
 
@@ -79,7 +79,7 @@ Install PostgreSQL, start the server, then run the setup wizard from the project
 python setup_postgres.py
 ```
 
-Enter the PostgreSQL `postgres` administrator password when prompted. The wizard creates the `edupilot` database and a limited app login, then saves its connection in the user's EduPilot application-data folder. It does not put credentials in project files. Start the app normally with `run.bat` or `./run.sh`.
+Enter the PostgreSQL `postgres` administrator password when prompted. The wizard creates the `edupilot` database and an EduPilot database role, then saves its connection in the user's EduPilot application-data folder. This role owns the application database so EduPilot can create and update its schema; do not treat it as a restricted read-only account. Credentials are kept out of project files. Start the app normally with `run.bat` or `./run.sh`.
 
 Alternatively, set `EDUPILOT_DATABASE_URL` before starting the app to override that saved connection. For example, on Windows PowerShell:
 
@@ -88,7 +88,7 @@ $env:EDUPILOT_DATABASE_URL = "postgresql://user:password@localhost:5432/edupilot
 python main.py
 ```
 
-The app creates its shared tables and demo accounts in PostgreSQL at startup. Personal voice notes and local app secrets stay in SQLite on each device. To run fully from SQLite, remove the saved connection file from the EduPilot application-data folder and unset `EDUPILOT_DATABASE_URL`. PostgreSQL mode is currently for a trusted LAN/demo; remote multi-device deployment needs an API service, TLS, and shared file storage.
+The app creates its shared tables and demo accounts in PostgreSQL at startup. Personal voice notes and device-local settings stay in SQLite; the QR signing secret is stored in PostgreSQL so connected faculty and student devices can validate the same attendance token. To run fully from SQLite, remove the saved connection file from the EduPilot application-data folder and unset `EDUPILOT_DATABASE_URL`. PostgreSQL mode is currently for a trusted LAN/demo; remote multi-device deployment needs an API service, TLS, and shared file storage.
 
 ---
 
@@ -111,7 +111,7 @@ The project comes pre-seeded with test accounts for Faculty and Student roles:
 
 ### Data and file storage
 
-Shared academic records are stored in PostgreSQL when configured. Private voice notes and local application secrets are stored in the per-device SQLite file. Uploaded course documents and assignment attachments are copied into a private, per-user application data folder; the database stores file keys and metadata rather than file contents. Uploads are limited to 25 MB and an extension allowlist. Existing SQLite databases in the older project `database/edupilot.db` location are copied to the new user data location on first launch, preserving their contents.
+Shared academic records are stored in PostgreSQL when configured. Private voice notes and device-local application settings are stored in SQLite. Uploaded course documents and assignment attachments are copied into a local application data folder; the database stores file keys and metadata rather than file contents. Uploads are limited to 25 MB and an extension allowlist. Existing SQLite databases in the older project `database/edupilot.db` location are copied to the new user data location on first launch, preserving their contents.
 
 Default data locations:
 
@@ -130,7 +130,7 @@ Optional environment variables:
 | `EDUPILOT_DATABASE_URL` | Configure PostgreSQL for shared academic records |
 | `EDUPILOT_FILES_DIR` | Store uploaded files in a separate local folder |
 
-There are no required secrets or cloud credentials. Back up the SQLite file and its sibling `files` folder together. A cloud/S3-compatible provider is appropriate only if a future deployment needs shared, multi-device access; signed URLs and remote storage are not implemented in this offline desktop build.
+There are no required cloud credentials. Back up the SQLite file and local `files` folder together. In PostgreSQL mode, back up PostgreSQL and the local files folder separately. PostgreSQL shares structured records, but uploaded files remain on each device; cloud storage, signed URLs, and automatic multi-device file sharing are not implemented.
 
 ### Run core workflow checks
 
@@ -155,7 +155,7 @@ aiassistant/
 ├── requirements.txt         # Complete dependency manifest
 ├── ai/                      # AI engines (RAG & Tutor)
 ├── attendance/              # Face & QR attendance modules
-├── database/                # SQLite database management & models
+├── database/                # SQLite/PostgreSQL data layer and models
 ├── gui/                     # PySide6 desktop interface components
 ├── lab/                     # Code execution & laboratory monitor
 ├── reports/                 # CSV, HTML, PDF, and Excel report exports
@@ -177,7 +177,8 @@ aiassistant/
 * **Solution**: Ensure `pip install --upgrade PySide6` was executed inside the virtual environment.
 
 #### 3. Re-initializing or Resetting Data
-* To reset the database to factory default test data, delete `edupilot.db` inside the project folder (if generated) and run `python main.py`. The database will auto-rebuild on startup.
+* Without PostgreSQL, the SQLite database is normally in the user's EduPilot application-data folder (Windows: `%LOCALAPPDATA%\EduPilot`; macOS: `~/Library/Application Support/EduPilot`; Linux: `$XDG_DATA_HOME/edupilot` or `~/.local/share/edupilot`). Removing that database resets local structured data the next time the app starts. Back up first; uploaded files and private notes may be stored beside it.
+* With PostgreSQL configured, removing a local SQLite file does not reset shared classroom records. Back up the database first, then use PostgreSQL administration tools to reset the `edupilot` database if a full reset is intended.
 
 #### 4. Existing virtual environment no longer starts
 * Run `setup.bat` on Windows or `./setup.sh` on macOS/Linux. The setup script checks the generated `venv` and recreates it if it is incomplete or points to a Python installation that has moved. Then use `run.bat` or `./run.sh` to launch EduPilot with that environment.

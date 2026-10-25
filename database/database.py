@@ -152,17 +152,46 @@ def _ensure_column(cursor, table: str, column: str, declaration: str) -> None:
 
 
 def get_or_create_app_secret(name: str) -> str:
+    """Read or create a secret in the store whose scope matches its use.
+
+    Device-only installs keep secrets in local SQLite. When PostgreSQL is
+    configured, shared features such as QR attendance need one common key so
+    tokens issued on one connected device can be validated by another.
+    """
+    if POSTGRES_URL:
+        conn = get_connection()
+        try:
+            row = conn.execute("SELECT value FROM app_settings WHERE name = ?", (name,)).fetchone()
+            if row:
+                return row[0]
+            value = secrets.token_hex(32)
+            # INSERT OR IGNORE maps to ON CONFLICT DO NOTHING for PostgreSQL.
+            # The follow-up read also handles two clients creating the same
+            # setting concurrently without replacing the winner's secret.
+            conn.execute("INSERT OR IGNORE INTO app_settings (name, value) VALUES (?, ?)", (name, value))
+            conn.commit()
+            row = conn.execute("SELECT value FROM app_settings WHERE name = ?", (name,)).fetchone()
+            if not row:
+                raise RuntimeError("Could not create the shared application secret.")
+            return row[0]
+        finally:
+            conn.close()
+
     conn = get_local_connection()
-    conn.execute("CREATE TABLE IF NOT EXISTS local_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    row = conn.execute("SELECT value FROM local_settings WHERE name = ?", (name,)).fetchone()
-    if row:
-        conn.close()
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS local_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        row = conn.execute("SELECT value FROM local_settings WHERE name = ?", (name,)).fetchone()
+        if row:
+            return row[0]
+        value = secrets.token_hex(32)
+        conn.execute("INSERT OR IGNORE INTO local_settings (name, value) VALUES (?, ?)", (name, value))
+        conn.commit()
+        row = conn.execute("SELECT value FROM local_settings WHERE name = ?", (name,)).fetchone()
+        if not row:
+            raise RuntimeError("Could not create the local application secret.")
         return row[0]
-    value = secrets.token_hex(32)
-    conn.execute("INSERT INTO local_settings (name, value) VALUES (?, ?)", (name, value))
-    conn.commit()
-    conn.close()
-    return value
+    finally:
+        conn.close()
 
 
 # ============================================================

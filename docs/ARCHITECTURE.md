@@ -2,65 +2,71 @@
 
 ## Product shape
 
-EduPilot is a local-first Windows/macOS/Linux desktop app. It has no web client or remote server, so screens call Python feature modules directly. Those modules validate the signed-in role and use parameterized SQLite operations. This keeps setup small and allows the core classroom workflows to run without a network connection.
+EduPilot is a local-first PySide6 desktop app. The faculty and student screens call Python feature modules directly; there is no web client or application server in this build. The app works with SQLite alone. When PostgreSQL is configured, shared classroom records use PostgreSQL while private device data remains in SQLite.
 
 ```text
-PySide6 UI
-  ├─ Faculty / student dashboards
-  └─ Feature widgets
+PySide6 desktop UI
+  ├─ Faculty workspace
+  └─ Student workspace
        ↓
-Python feature services
-  ├─ Attendance and signed QR validation
-  ├─ Academic, assignment, lab, notice and schedule workflows
-  ├─ Local FAQ/document retrieval
-  └─ Local storage service
-       ↓                         ↓
-SQLite records and metadata   Per-user files directory
+Python feature modules
+  ├─ Login, attendance, QR validation, academics, assignments
+  ├─ Timetable, notices, reminders, labs, and practical exams
+  ├─ Local course-document search and optional offline speech
+  └─ Role checks, input validation, and report generation
+       ↓
+PostgreSQL (shared academic records, when configured)
+SQLite (single-device records and private local data)
+Local managed files (course uploads and assignment attachments)
 ```
 
 ## Main components
 
 | Area | Location | Responsibility |
 | --- | --- | --- |
-| Application startup | `main.py` | Start Qt, initialize/migrate the local database, show a clear startup error, open login |
-| Authentication | `gui/login.py`, `database/database.py` | Verify PBKDF2-SHA256 password hashes and route to role-specific workspace |
-| Faculty workspace | `gui/faculty_dashboard.py` | Directory, attendance, analytics, academics, assignments, local study tools, timetable, lab and notices |
-| Student workspace | `gui/student_dashboard.py` | Personal records, submissions, schedule, notices, course materials and study tools |
-| Database | `database/database.py` | SQLite schema, additive migrations, role checks, data access, audit events and seed examples |
-| Course retrieval | `ai/rag_engine.py` | Index approved local text/PDF material and retrieve local FAQ, notes and question-bank matches |
-| File storage | `storage/local_storage.py` | Validate and copy uploads under unique local keys; resolve paths safely; record metadata and prune unreferenced uploads |
-| Optional execution | `lab/code_runner.py`, `docker/Dockerfile.runner` | Run code through a restricted Docker container, when the image is installed |
+| Startup | `main.py` | Starts Qt, initializes configured stores, reports startup errors, and opens login. |
+| Authentication | `gui/login.py`, `database/database.py` | Verifies salted PBKDF2-SHA256 password hashes and selects the faculty or student workspace. |
+| Faculty workspace | `gui/faculty_dashboard.py` | Student directory, attendance, analytics, academics, assignments, notes, notices, timetable, workstation, voice, exam management, and lab review. |
+| Student workspace | `gui/student_dashboard.py` | Personal attendance and academics, assignments, course materials, code runner, labs, schedule, practical exams, voice tools, and private notes. |
+| Data access | `database/database.py` | Creates and migrates schemas, performs parameterized queries, enforces role checks, records audit events, and seeds demo data. |
+| PostgreSQL adapter | `database/postgres_compat.py` | Translates the current SQLite-shaped data-layer SQL into the subset used with PostgreSQL. It is a compatibility layer, not a replacement for a future versioned migration/service architecture. |
+| Course retrieval | `ai/rag_engine.py`, `ai/tutor_engine.py` | Indexes readable local text/PDF material and returns matching FAQs, document passages, and question-bank results with source labels. Retrieval is local; no generative language model is bundled. |
+| File storage | `storage/local_storage.py` | Copies allowed uploads under opaque random keys, checks size and path containment, and stores file metadata in the configured shared database. |
+| Optional code execution | `lab/code_runner.py`, `docker/Dockerfile.runner` | Runs student code only in the restricted Docker image when Docker and that image are available. |
+| Voice | `voice/`, `gui/speech_worker.py` | Handles typed commands and optional local Vosk microphone input. Recognized commands are shown for review, and sensitive actions require confirmation. |
 
-## Data model
+## Data placement
 
-The SQLite database stores account and classroom records: `users`, `students`, `subjects`, `attendance_sessions`, `attendance_records`, `academics`, `timetables`, `assignments`, `assignment_submissions`, `notes`, `question_banks`, `documents`, `document_chunks`, `lab_experiments`, `lab_submissions`, `lab_exams`, `lab_exam_submissions`, `announcements`, `reminders`, `voice_notes`, `assistant_query_events`, `audit_log`, `app_settings`, and `stored_files`.
+| Store | Contents | Sharing behaviour |
+| --- | --- | --- |
+| PostgreSQL, when configured | Accounts, students, attendance, academics, assignments/submissions, course material metadata, question bank, notices, reminders, timetable, lab work, practical exams, audit events, and shared app settings such as the QR signing key. | Shared by clients connected to the same database. |
+| SQLite | Private voice notes, local application settings/secrets, and all structured app data when PostgreSQL is not configured. | Belongs to one installation unless the user manually moves/backups the database. |
+| Local files directory | Uploaded course documents and assignment attachments. The database stores opaque keys and metadata, not their binary contents. | Files stay on each computer; PostgreSQL does not synchronize them. |
 
-Foreign keys and unique constraints protect core relationships and duplicate attendance/submission records. Indexes cover common date, owner, assignment, document-chunk, and reminder queries. Existing project-folder databases migrate by SQLite backup into the user data folder; schema updates add missing columns and keep existing rows. `PRAGMA user_version` records the current schema generation.
+With PostgreSQL configured, QR tokens use a shared HMAC secret in PostgreSQL so a faculty device can issue a code that a student device connected to that same database can validate. In SQLite-only mode, the secret remains local, which is appropriate for a single-device setup.
 
-## File storage
+The app has no built-in REST API, cloud file storage, or automatic multi-device file synchronization. PostgreSQL shares structured records only; for another computer to open an uploaded file, it must have access to the same managed files directory or a future shared-storage service must be added.
 
-Binary uploads are not put into SQLite. `LocalStorageService` streams the selected file into a category folder using a random file name. It allows only configured document and submission extensions and caps uploads at 25 MB. The database records an opaque key, original name, MIME type, byte size, owner, and timestamp. UI components resolve stored keys through the service instead of trusting user-provided paths.
+## Local paths and backup
 
-Use `EDUPILOT_DATA_DIR` to move the database and default files directory together, `EDUPILOT_DB_PATH` to select a SQLite file, or `EDUPILOT_FILES_DIR` to move uploaded files separately. Back up the database and file directory as a pair. Existing legacy paths continue to work on the computer where they were created; newly uploaded files are managed and portable with that pair.
+- `EDUPILOT_DATA_DIR` selects the per-user application data folder.
+- `EDUPILOT_DB_PATH` selects a SQLite database file when running without PostgreSQL.
+- `EDUPILOT_DATABASE_URL` configures PostgreSQL and takes precedence over the saved connection URL.
+- `EDUPILOT_FILES_DIR` selects the managed upload folder.
 
-The storage boundary is provider-oriented, but only local filesystem storage exists today. S3-compatible storage, signed URLs, remote file authorization, and multi-device synchronization require a future server/API deployment and are not claimed as implemented.
+Without overrides, app data is stored in `%LOCALAPPDATA%\\EduPilot` on Windows, `~/Library/Application Support/EduPilot` on macOS, and `$XDG_DATA_HOME/edupilot` (or `~/.local/share/edupilot`) on Linux. Back up the SQLite database and the managed files folder together. PostgreSQL data needs a PostgreSQL backup; the local files directory must also be backed up separately.
 
-## Security and limits
+## Security boundaries
 
-- Passwords use salted PBKDF2-SHA256 and constant-time comparison.
-- User values are passed as SQL parameters; faculty-only operations check the account role in the data layer.
-- Students retrieve personal attendance, marks, reminders, and submissions using their user identity; course notes are shared through the approved course workspace.
-- QR attendance tokens are signed with HMAC-SHA256 and expire after five minutes. A valid code can still be shared, so QR is not described as identity proof.
-- Student uploads are extension-allowlisted and size-limited. They are stored as files and are never executed by EduPilot.
-- Code execution requires Docker and applies network, filesystem, process, CPU, memory, user, and timeout restrictions. No host-shell fallback is provided.
-- This app is for local desktop use. It does not provide remote sessions, server-side rate limiting, REST endpoints, CORS, cloud storage, or institution-wide multi-user synchronization.
+- Passwords are stored as salted PBKDF2-SHA256 hashes; comparisons use constant-time checks.
+- Data values are passed as SQL parameters. Faculty-only data operations check the account role in the data layer; student record queries are scoped to the signed-in user.
+- Attendance QR tokens are section-bound, HMAC-SHA256 signed, and expire after five minutes. They do not prove student identity and can be shared during their validity window.
+- Face recognition is disabled. Face detection alone is not used to identify a student.
+- Managed uploads are extension-allowlisted, limited to 25 MB, copied under random names, and never executed as a program by EduPilot.
+- The code runner has no network access, a read-only base filesystem, a temporary workspace, resource limits, and an execution timeout. It has no host-shell fallback.
+- Practical exams persist an attempt deadline and autosave drafts. The fullscreen interface restricts normal in-app navigation but is not an OS kiosk and cannot prevent operating-system task switching or administrator actions.
+- PostgreSQL mode is for a controlled, trusted network. Do not expose the database directly to the public internet. A production multi-user deployment needs an authenticated API, TLS, managed identity/access, and shared file storage.
 
-## Checks
+## Supported and optional capabilities
 
-Run the standard-library core workflow suite with:
-
-```text
-python -m unittest discover -s tests -v
-```
-
-The suite covers repeatable schema initialization, login hashing, legacy database copy, signed QR attendance, assignment file storage, local document retrieval, and orphan cleanup. UI integration still requires installing the GUI dependencies listed in `requirements.txt` and launching with `run.bat` or `run.sh`.
+Core desktop features use `requirements.txt`. Offline microphone recognition, text-to-speech, and camera scanning use optional dependencies from `requirements-optional.txt`; voice recognition also needs a separately installed Vosk model. Student code execution needs Docker and the `edupilot-runner` image. Face identity matching, OS-level exam lockdown, cloud synchronization, and automatic multi-device file sharing are not implemented.
