@@ -61,13 +61,13 @@ The microphone requires the optional packages and a separately downloaded Vosk E
 
 ### Optional student code runner
 
-The student code runner needs Docker Desktop or Docker Engine with Linux containers enabled. Build its restricted execution image from the project root:
+The student code runner needs Docker Desktop or Docker Engine with Linux containers enabled. On Windows, double-click `setup_runner.bat` from the `aiassistant` folder. On macOS/Linux, run `chmod +x setup_runner.sh` once, then `./setup_runner.sh`. These scripts check that Docker is running and build the restricted runner image. The equivalent manual command, run from the `aiassistant` folder, is:
 
 ```bash
 docker build -f docker/Dockerfile.runner -t edupilot-runner:latest docker
 ```
 
-The runner has no network, a read-only base filesystem, a temporary per-run workspace, a 256 MB memory cap, process limit, and execution timeout. If Docker or the image is unavailable, EduPilot reports that code was not run. Do not switch this feature to direct host execution for untrusted programs.
+The runner has no network, a read-only base filesystem, a temporary per-run workspace, a 256 MB memory cap, process limit, and execution timeout. If Docker or the image is unavailable, EduPilot reports that code was not run and tells you how to set it up. Do not switch this feature to direct host execution for untrusted programs.
 
 Practical exams open in fullscreen after the student confirms. The app keeps the exam timer running, autosaves a private draft, submits the last answer when time expires, and prevents normal in-app navigation or closing until submission or timeout. This is an app-level exam mode; Windows shortcuts and administrator tools can still switch away or stop the app, so it is not a managed-device kiosk or remote proctoring system.
 
@@ -162,6 +162,7 @@ audio dependency are detected. EduPilot does not upload audio or transcripts.
 aiassistant/
 ├── main.py                  # Application entry point
 ├── setup.bat / setup.sh     # 1-click automated environment setup scripts
+├── setup_runner.bat / .sh   # Build the restricted Docker runner image
 ├── run.bat / run.sh         # 1-click application launchers
 ├── requirements.txt         # Complete dependency manifest
 ├── ai/                      # AI engines (RAG & Tutor)

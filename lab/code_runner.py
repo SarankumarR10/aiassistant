@@ -23,7 +23,7 @@ class CodeRunnerEngine:
             return {"status": "error", "output": "Program exceeds the 100,000 character limit.", "ai_explanation": ""}
         docker = shutil.which("docker")
         if not docker:
-            return {"status": "unavailable", "output": "The isolated runner is not configured. Install Docker and build the edupilot-runner image; this program was not executed.", "ai_explanation": ""}
+            return {"status": "unavailable", "output": "Docker is not installed or is not on PATH. Install Docker Desktop with Linux containers enabled, restart EduPilot, then run setup_runner.bat from the project folder. This program was not executed.", "ai_explanation": ""}
         if lang in ("python", "py"):
             source, commands = "solution.py", [["python", "/workspace/solution.py"]]
             display_lang = "Python"
@@ -38,6 +38,18 @@ class CodeRunnerEngine:
             display_lang = "Java"
         else:
             return {"status": "error", "output": f"Unsupported language: {language}", "ai_explanation": ""}
+
+        try:
+            image = subprocess.run(
+                [docker, "image", "inspect", self.IMAGE], capture_output=True,
+                text=True, timeout=10, stdin=subprocess.DEVNULL, shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "unavailable", "output": "Docker did not respond. Start Docker Desktop and try again. If this is the first run, run setup_runner.bat from the project folder to build the isolated runner image.", "ai_explanation": ""}
+        except OSError:
+            return {"status": "unavailable", "output": "Docker could not be started. Confirm Docker Desktop is installed and running, then run setup_runner.bat from the project folder if the image has not been built.", "ai_explanation": ""}
+        if image.returncode:
+            return {"status": "unavailable", "output": "The isolated runner image is not ready or Docker Desktop is not running. Start Docker Desktop, then run setup_runner.bat from the project folder. This program was not executed.", "ai_explanation": ""}
 
         with tempfile.TemporaryDirectory(prefix="edupilot-run-") as work_dir:
             try:
