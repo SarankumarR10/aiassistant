@@ -41,11 +41,11 @@ Local managed files (course uploads and assignment attachments)
 | --- | --- | --- |
 | PostgreSQL, when configured | Accounts, students, attendance, academics, assignments/submissions, course material metadata, question bank, notices, reminders, timetable, lab work, practical exams, audit events, and shared app settings such as the QR signing key. | Shared by clients connected to the same database. |
 | SQLite | Private voice notes, local application settings/secrets, and all structured app data when PostgreSQL is not configured. | Belongs to one installation unless the user manually moves/backups the database. |
-| Local files directory | Uploaded course documents and assignment attachments. The database stores opaque keys and metadata, not their binary contents. | Files stay on each computer; PostgreSQL does not synchronize them. |
+| Managed files directory | Uploaded course documents and assignment attachments. The database stores opaque keys and metadata, not their binary contents. | Local by default; clients can use the same manually configured network share through `EDUPILOT_FILES_DIR`. PostgreSQL itself does not synchronize file contents. |
 
 With PostgreSQL configured, QR tokens use a shared HMAC secret in PostgreSQL so a faculty device can issue a code that a student device connected to that same database can validate. In SQLite-only mode, the secret remains local, which is appropriate for a single-device setup.
 
-The app has no built-in REST API, cloud file storage, or automatic multi-device file synchronization. PostgreSQL shares structured records only; for another computer to open an uploaded file, it must have access to the same managed files directory or a future shared-storage service must be added.
+The app has no built-in REST API, cloud file storage, or automatic multi-device file synchronization. PostgreSQL shares structured records only; for another computer to open an uploaded file, it must have access to the same managed files directory. A shared network folder can provide that access when all clients point `EDUPILOT_FILES_DIR` at the same share and have the required permissions.
 
 ## Local paths and backup
 
@@ -54,7 +54,7 @@ The app has no built-in REST API, cloud file storage, or automatic multi-device 
 - `EDUPILOT_DATABASE_URL` configures PostgreSQL and takes precedence over the saved connection URL.
 - `EDUPILOT_FILES_DIR` selects the managed upload folder.
 
-Without overrides, app data is stored in `%LOCALAPPDATA%\\EduPilot` on Windows, `~/Library/Application Support/EduPilot` on macOS, and `$XDG_DATA_HOME/edupilot` (or `~/.local/share/edupilot`) on Linux. Back up the SQLite database and the managed files folder together. PostgreSQL data needs a PostgreSQL backup; the local files directory must also be backed up separately.
+Without overrides, app data is stored in `%LOCALAPPDATA%\\EduPilot` on Windows, `~/Library/Application Support/EduPilot` on macOS, and `$XDG_DATA_HOME/edupilot` (or `~/.local/share/edupilot`) on Linux. Back up the SQLite database and the managed files folder together. PostgreSQL data needs a PostgreSQL backup; the managed files directory must also be backed up separately.
 
 ## Security boundaries
 

@@ -88,7 +88,18 @@ $env:EDUPILOT_DATABASE_URL = "postgresql://user:password@localhost:5432/edupilot
 python main.py
 ```
 
-The app creates its shared tables and demo accounts in PostgreSQL at startup. Personal voice notes and device-local settings stay in SQLite; the QR signing secret is stored in PostgreSQL so connected faculty and student devices can validate the same attendance token. To run fully from SQLite, remove the saved connection file from the EduPilot application-data folder and unset `EDUPILOT_DATABASE_URL`. PostgreSQL mode is currently for a trusted LAN/demo; remote multi-device deployment needs an API service, TLS, and shared file storage.
+The app creates its shared tables and demo accounts in PostgreSQL at startup. Personal voice notes and device-local settings stay in SQLite; the QR signing secret is stored in PostgreSQL so connected faculty and student devices can validate the same attendance token. To run fully from SQLite, remove the saved connection file from the EduPilot application-data folder and unset `EDUPILOT_DATABASE_URL`. PostgreSQL mode is currently for a trusted LAN/demo; remote multi-device deployment needs an API service and TLS.
+
+### Make uploaded files available on multiple computers
+
+PostgreSQL shares file records, but file contents are stored separately. To let clients open the same uploaded notes and assignment attachments, put EduPilot's managed files on a network folder that every client can read and write, then set `EDUPILOT_FILES_DIR` to that same folder on each computer before starting the app. For example, in PowerShell:
+
+```powershell
+$env:EDUPILOT_FILES_DIR = "\\classroom-server\EduPilotFiles"
+.\run.bat
+```
+
+Replace the example share with the actual shared folder. Each computer must use the same path and have permission to access it. If `EDUPILOT_FILES_DIR` is not set, uploads remain in that computer's local EduPilot data folder. EduPilot does not create or synchronize a network share itself.
 
 ---
 
@@ -111,7 +122,7 @@ The project comes pre-seeded with test accounts for Faculty and Student roles:
 
 ### Data and file storage
 
-Shared academic records are stored in PostgreSQL when configured. Private voice notes and device-local application settings are stored in SQLite. Uploaded course documents and assignment attachments are copied into a local application data folder; the database stores file keys and metadata rather than file contents. Uploads are limited to 25 MB and an extension allowlist. Existing SQLite databases in the older project `database/edupilot.db` location are copied to the new user data location on first launch, preserving their contents.
+Shared academic records are stored in PostgreSQL when configured. Private voice notes and device-local application settings are stored in SQLite. Uploaded course documents and assignment attachments are copied into the managed files folder; the database stores file keys and metadata rather than file contents. By default, the files folder is local, but `EDUPILOT_FILES_DIR` can point all clients to the same network share. Uploads are limited to 25 MB and an extension allowlist. Existing SQLite databases in the older project `database/edupilot.db` location are copied to the new user data location on first launch, preserving their contents.
 
 Default data locations:
 
@@ -128,9 +139,9 @@ Optional environment variables:
 | `EDUPILOT_DATA_DIR` | Override the per-user data folder (database and default file folder) |
 | `EDUPILOT_DB_PATH` | Use a specific SQLite database file |
 | `EDUPILOT_DATABASE_URL` | Configure PostgreSQL for shared academic records |
-| `EDUPILOT_FILES_DIR` | Store uploaded files in a separate local folder |
+| `EDUPILOT_FILES_DIR` | Store uploads in a chosen folder; use the same accessible shared-folder path on each client to share uploaded files |
 
-There are no required cloud credentials. Back up the SQLite file and local `files` folder together. In PostgreSQL mode, back up PostgreSQL and the local files folder separately. PostgreSQL shares structured records, but uploaded files remain on each device; cloud storage, signed URLs, and automatic multi-device file sharing are not implemented.
+There are no required cloud credentials. Back up the SQLite file and local `files` folder together. In PostgreSQL mode, back up PostgreSQL and the managed files folder separately. A shared network folder can make uploads available to connected clients when configured as described above; cloud storage and automatic file synchronization are not implemented.
 
 ### Run core workflow checks
 

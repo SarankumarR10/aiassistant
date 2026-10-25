@@ -12,10 +12,13 @@ import psycopg
 from psycopg import sql
 
 
-APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "EduPilot"
-if sys.platform == "darwin":
+if os.environ.get("EDUPILOT_DATA_DIR"):
+    APP_DATA_DIR = Path(os.environ["EDUPILOT_DATA_DIR"]).expanduser()
+elif sys.platform == "win32":
+    APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "EduPilot"
+elif sys.platform == "darwin":
     APP_DATA_DIR = Path.home() / "Library" / "Application Support" / "EduPilot"
-elif sys.platform.startswith("linux"):
+else:
     APP_DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "edupilot"
 
 DB_NAME = "edupilot"
