@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 if not exist "venv\Scripts\python.exe" (
     echo [ERROR] The project Python environment is missing.
     echo Run 'setup.bat' first to install packages and set up the project.

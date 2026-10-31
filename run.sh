@@ -1,4 +1,5 @@
 #!/bin/bash
+cd "$(dirname "$0")"
 if [ ! -x "venv/bin/python" ]; then
     echo "[ERROR] The project Python environment is missing."
     echo "Please run './setup.sh' first to install packages."

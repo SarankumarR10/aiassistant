@@ -17,6 +17,7 @@ _NUMBER_WORDS = {
     "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
     "eighty": 80, "ninety": 90,
 }
+_COURSE_MATERIAL_HINTS = ("notes", "note", "manual", "materials", "material", "document")
 
 
 def _spoken_number(value: str) -> int | None:
@@ -48,6 +49,9 @@ def _normalize_voice_text(text: str) -> str:
     clean = re.sub(r"\b(read|show)\s+(the\s+)?announcements?\b", "read announcements", clean)
     clean = re.sub(r"\b(read|show)\s+(the\s+)?notices?\b", "read notices", clean)
     clean = re.sub(r"\b(read|show)\s+(my\s+)?reminders?\b", "read reminders", clean)
+    clean = re.sub(r"\b(read|show)\s+(the\s+)?(class\s+)?timetable\b", "read schedule", clean)
+    clean = re.sub(r"\b(go\s+to\s+)?next\s+slides?\b", "next slide", clean)
+    clean = re.sub(r"\b(go\s+to\s+)?(previous|prior)\s+slides?\b", "previous slide", clean)
     clean = re.sub(r"\bnext slides?\b", "next slide", clean)
     clean = re.sub(r"\b(previous|prior) slides?\b", "previous slide", clean)
     clean = re.sub(r"^(please\s+|could you\s+|can you\s+)+", "", clean)
@@ -57,8 +61,9 @@ def _normalize_voice_text(text: str) -> str:
         target = re.sub(r"\b(the|please|application|editor)\b", " ", app_request.group(2))
         target = re.sub(r"[^a-z0-9]+", " ", target).strip()
         compact = target.replace(" ", "")
-        aliases = ("vscode", "vscoad", "uscode", "thiscode", "westcoast", "yescode", "score", "code")
-        if max(SequenceMatcher(None, compact, alias).ratio() for alias in aliases) >= 0.75:
+        aliases = ("vscode", "vsc", "vscoad", "vscoed", "vscod", "visualstudiocode",
+                   "visualstudio", "uscode", "thiscode", "westcoast", "yescode", "score", "code")
+        if max(SequenceMatcher(None, compact, alias).ratio() for alias in aliases) >= 0.70:
             clean = f"{app_request.group(1)} vs code"
     return clean
 
@@ -123,6 +128,28 @@ class VoiceEngine:
         if not command and has_wake:
             return {"status": "success", "intent": "greet", "reply": "Hello! I am EduPilot. How can I help you today?"}
 
+        search_match = re.match(
+            r"^(?:search|find|look for|locate)\s+(?:(?:in\s+)?(?:my|this|the)\s+computer\s+)?"
+            r"(?:for\s+)?(?:(?:a|an|the|my)\s+)?"
+            r"(?:(files?|documents?|apps?|applications?|programs?)\s+(?:for\s+)?)?(.+)$",
+            command,
+        )
+        is_course_material_request = command.startswith(("open ", "show ", "find ")) and any(
+            word in command.split() for word in _COURSE_MATERIAL_HINTS
+        )
+        if search_match and not is_course_material_request:
+            target = search_match.group(1) or ""
+            query = search_match.group(2).strip()
+            if query:
+                kind = "apps" if target.rstrip("s") in {"app", "application", "program"} else (
+                    "files" if target else "all"
+                )
+                return {
+                    "status": "success", "intent": "search_local_item", "query": query,
+                    "kind": kind,
+                    "reply": f"Searching your computer for {query}.",
+                }
+
         # Match smart lab assistant commands (Feature 6)
         if "open vs code" in command or "open vscode" in command:
             return self._launch_app("code", "VS Code")
@@ -140,6 +167,35 @@ class VoiceEngine:
             return self._launch_app("git-bash", "Git Bash")
         elif "open powerpoint" in command or "open ppt" in command:
             return self._launch_app("powerpnt", "Microsoft PowerPoint")
+        elif (command.startswith(("open ", "show ", "find "))
+              and any(word in command.split() for word in _COURSE_MATERIAL_HINTS)):
+            query = re.sub(
+                r"\b(open|show|find|the|my|course|lecture|lab|notes?|manuals?|materials?|material|documents?|files?|about|on|for|with)\b",
+                " ", command,
+            )
+            query = re.sub(r"\s+", " ", query).strip()
+            return {
+                "status": "confirmation_required",
+                "intent": "open_course_material",
+                "query": query,
+                "reply": "Find a course document, review the match, and confirm before opening it.",
+            }
+        elif command.startswith(("open ", "launch ")):
+            open_match = re.match(
+                r"^(?:open|launch)\s+(?:(?:a|the)\s+)?"
+                r"(?:(file|document|app|application|program)\s+)?(.+)$",
+                command,
+            )
+            if open_match:
+                target, query = open_match.groups()
+                kind = "apps" if target in {"app", "application", "program"} else (
+                    "files" if target in {"file", "document"} else "all"
+                )
+                return {
+                    "status": "success", "intent": "search_local_item", "query": query.strip(),
+                    "kind": kind,
+                    "reply": f"Searching your computer for {query.strip()}.",
+                }
         
         # Classroom control (Feature 11)
         elif "next slide" in command:

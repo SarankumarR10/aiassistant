@@ -2,7 +2,6 @@
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import uuid
 
@@ -21,9 +20,6 @@ class CodeRunnerEngine:
             return {"status": "error", "output": "Enter a program before running it.", "ai_explanation": ""}
         if len(code_text) > self.MAX_CODE_CHARS:
             return {"status": "error", "output": "Program exceeds the 100,000 character limit.", "ai_explanation": ""}
-        docker = shutil.which("docker")
-        if not docker:
-            return {"status": "unavailable", "output": "Docker is not installed or is not on PATH. Install Docker Desktop with Linux containers enabled, restart EduPilot, then run setup_runner.bat from the project folder. This program was not executed.", "ai_explanation": ""}
         if lang in ("python", "py"):
             source, commands = "solution.py", [["python", "/workspace/solution.py"]]
             display_lang = "Python"
@@ -39,17 +35,54 @@ class CodeRunnerEngine:
         else:
             return {"status": "error", "output": f"Unsupported language: {language}", "ai_explanation": ""}
 
+        docker = shutil.which("docker")
+        if not docker:
+            return self._unavailable(
+                "Docker is not installed or is not on PATH. Install Docker Desktop with Linux containers enabled, "
+                "then restart EduPilot. This program was not executed."
+            )
+
+        try:
+            engine = subprocess.run(
+                [docker, "info", "--format", "{{.ServerVersion}}"], capture_output=True,
+                text=True, timeout=8, stdin=subprocess.DEVNULL, shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            return self._unavailable(
+                "Docker Desktop did not respond. Open Docker Desktop and wait until its engine is running, "
+                "then try again. This program was not executed."
+            )
+        except OSError:
+            return self._unavailable(
+                "Docker could not be started. Confirm Docker Desktop is installed and running. "
+                "This program was not executed."
+            )
+        if engine.returncode:
+            return self._unavailable(
+                "Docker Desktop is installed, but its Linux engine is not running. Open Docker Desktop, "
+                "wait until it reports that the engine is running, then try again. This program was not executed."
+            )
+
         try:
             image = subprocess.run(
                 [docker, "image", "inspect", self.IMAGE], capture_output=True,
                 text=True, timeout=10, stdin=subprocess.DEVNULL, shell=False,
             )
         except subprocess.TimeoutExpired:
-            return {"status": "unavailable", "output": "Docker did not respond. Start Docker Desktop and try again. If this is the first run, run setup_runner.bat from the project folder to build the isolated runner image.", "ai_explanation": ""}
+            return self._unavailable(
+                "Docker did not respond while checking the runner image. Start Docker Desktop and try again. "
+                "This program was not executed."
+            )
         except OSError:
-            return {"status": "unavailable", "output": "Docker could not be started. Confirm Docker Desktop is installed and running, then run setup_runner.bat from the project folder if the image has not been built.", "ai_explanation": ""}
+            return self._unavailable(
+                "Docker could not be started. Confirm Docker Desktop is installed and running. "
+                "This program was not executed."
+            )
         if image.returncode:
-            return {"status": "unavailable", "output": "The isolated runner image is not ready or Docker Desktop is not running. Start Docker Desktop, then run setup_runner.bat from the project folder. This program was not executed.", "ai_explanation": ""}
+            return self._unavailable(
+                "The isolated runner image is missing. Open PowerShell in the EduPilot folder and run "
+                "setup_runner.bat to build it, then retry. This program was not executed."
+            )
 
         with tempfile.TemporaryDirectory(prefix="edupilot-run-") as work_dir:
             try:
@@ -78,11 +111,20 @@ class CodeRunnerEngine:
                 return {"status": "timeout", "output": f"Execution exceeded the {timeout_sec}-second limit.",
                         "ai_explanation": "The sandbox stopped the program when its time limit expired."}
             except FileNotFoundError:
-                return {"status": "unavailable", "output": "Docker is installed but could not start the isolated runner. Confirm the Docker service is running and build the edupilot-runner image.", "ai_explanation": ""}
+                return self._unavailable(
+                    "Docker could not start the isolated runner. Check Docker Desktop, run setup_runner.bat "
+                    "if the image is missing, then retry. This program was not executed."
+                )
+            except subprocess.SubprocessError as error:
+                return self._unavailable(f"Docker could not run this program: {error}. This program was not executed.")
             except subprocess.CalledProcessError as error:
                 return {"status": "error", "output": (error.stderr or error.stdout or str(error))[:self.MAX_OUTPUT_CHARS], "ai_explanation": ""}
             except Exception as error:
                 return {"status": "error", "output": str(error), "ai_explanation": ""}
+
+    @staticmethod
+    def _unavailable(message: str) -> dict:
+        return {"status": "unavailable", "output": message, "ai_explanation": ""}
 
     def _run_container(self, docker: str, work_dir: str, command: list[str], timeout_sec: int):
         container_name = f"edupilot-run-{uuid.uuid4().hex[:12]}"

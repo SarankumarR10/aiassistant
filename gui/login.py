@@ -153,7 +153,17 @@ class LoginWindow(QWidget):
             )
             return
 
-        user = authenticate_user(username, password)
+        try:
+            user = authenticate_user(username, password)
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Could not sign in",
+                "EduPilot could not check this account against the configured database. "
+                "The sign-in window is still open.\n\n"
+                f"Details: {error}",
+            )
+            return
 
         if user is None:
             QMessageBox.warning(
@@ -173,20 +183,30 @@ class LoginWindow(QWidget):
             )
             return
 
+        # Build the full dashboard before hiding login. Dashboard construction
+        # loads several modules and may fail when a database migration is
+        # incomplete; hiding first left users with no visible window.
+        try:
+            if user[2] == "faculty":
+                dashboard = FacultyDashboard(user, self.show_login)
+            else:
+                dashboard = StudentDashboard(user, self.show_login)
+            dashboard.show()
+            dashboard.raise_()
+            dashboard.activateWindow()
+        except Exception as error:
+            self.dashboard = None
+            QMessageBox.critical(
+                self,
+                "Dashboard could not open",
+                "Your account was accepted, but EduPilot could not finish loading "
+                "the dashboard. The sign-in window is still open.\n\n"
+                f"Details: {error}",
+            )
+            return
+
+        self.dashboard = dashboard
         self.hide()
-
-        if user[2] == "faculty":
-            self.dashboard = FacultyDashboard(
-                user,
-                self.show_login
-            )
-        else:
-            self.dashboard = StudentDashboard(
-                user,
-                self.show_login
-            )
-
-        self.dashboard.show()
 
     def show_login(self):
         self.username.clear()

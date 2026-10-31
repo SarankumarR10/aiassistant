@@ -10,6 +10,8 @@ import re
 
 
 _INSERT_TABLE = re.compile(r"^\s*INSERT\s+(?:OR\s+(?:IGNORE|REPLACE)\s+)?INTO\s+([a-zA-Z_][\w]*)", re.I)
+# These tables use natural/text primary keys and have no generated `id`.
+_TABLES_WITHOUT_GENERATED_ID = {"app_settings", "local_settings", "stored_files", "faculty_profiles"}
 
 
 def _translate(sql: str) -> tuple[str, str | None]:
@@ -57,11 +59,13 @@ class PostgresCursor:
         table = match.group(1).lower() if match else ""
         # Preserve sqlite cursor.lastrowid used by the app. Tables with a
         # generated integer id return it directly from PostgreSQL.
-        if kind == "insert" and table != "app_settings" and not re.search(r"\bRETURNING\b", statement, re.I):
+        if (kind == "insert" and table not in _TABLES_WITHOUT_GENERATED_ID
+                and not re.search(r"\bRETURNING\b", statement, re.I)):
             statement = re.sub(r"\s*;?\s*$", " RETURNING id", statement)
         self._cursor.execute(statement, parameters)
         self._lastrowid = None
-        if kind == "insert" and table != "app_settings" and re.search(r"\bRETURNING\s+id\s*$", statement, re.I):
+        if (kind == "insert" and table not in _TABLES_WITHOUT_GENERATED_ID
+                and re.search(r"\bRETURNING\s+id\s*$", statement, re.I)):
             row = self._cursor.fetchone()
             self._lastrowid = row[0] if row else None
         return self

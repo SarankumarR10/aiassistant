@@ -145,6 +145,7 @@ class LocalStorageService:
                 SELECT f.storage_key FROM stored_files f
                 WHERE NOT EXISTS (SELECT 1 FROM notes n WHERE n.file_path = 'edupilot-storage://' || f.storage_key)
                   AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.file_path = 'edupilot-storage://' || f.storage_key)
+                  AND NOT EXISTS (SELECT 1 FROM lab_experiments e WHERE e.manual_path = 'edupilot-storage://' || f.storage_key)
                   AND NOT EXISTS (SELECT 1 FROM assignment_submissions s WHERE s.file_path = 'edupilot-storage://' || f.storage_key)
             """).fetchall()]
         finally:

@@ -1,12 +1,12 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton,
+    QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QHeaderView,
 )
 
 from database.database import (
     get_all_academic_records, get_student_academic_records,
-    save_academic_record,
+    save_academic_record, get_academic_classes,
 )
 from gui.theme import POSITIVUS_QSS, create_section_header
 
@@ -33,14 +33,29 @@ class AcademicTrackerWidget(QWidget):
         )
         layout.addWidget(create_section_header("Academic Records", subtitle))
 
+        if self.role == "faculty":
+            filter_row = QHBoxLayout()
+            self.class_filter = QComboBox()
+            self.class_filter.addItem("All assigned classes", None)
+            self.class_rows = get_academic_classes(faculty_id=self.user[0])
+            for class_row in self.class_rows:
+                self.class_filter.addItem(
+                    f"{class_row[1]} · Year {class_row[2]} · Section {class_row[3]} · {class_row[4]}",
+                    class_row[0],
+                )
+            self.class_filter.currentIndexChanged.connect(self.load_records)
+            filter_row.addWidget(QLabel("Class:"))
+            filter_row.addWidget(self.class_filter, 1)
+            layout.addLayout(filter_row)
+
         self.table = QTableWidget()
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         if self.role == "faculty":
-            self.table.setColumnCount(7)
+            self.table.setColumnCount(8)
             self.table.setHorizontalHeaderLabels(
-                ["Roll Number", "Student", "Subject", "Internal / 100", "Assignment / 100", "Lab / 100", "Total / 300"]
+                ["Academic Class", "Roll Number", "Student", "Subject", "Internal / 100", "Assignment / 100", "Lab / 100", "Total / 300"]
             )
             self.table.itemSelectionChanged.connect(self._select_record)
         else:
@@ -80,14 +95,15 @@ class AcademicTrackerWidget(QWidget):
     def load_records(self):
         self.table.setRowCount(0)
         if self.role == "faculty":
-            rows = get_all_academic_records(self.user[0])
+            rows = get_all_academic_records(self.user[0], self.class_filter.currentData())
             for row, record in enumerate(rows):
-                student_id, roll, student, subject_id, code, subject, internal, assignment, lab, total = record
+                student_id, roll, student, subject_id, code, subject, internal, assignment, lab, total = record[:10]
+                class_label = f"{record[11]} · Year {record[12]} · Section {record[13]} · {record[14]}"
                 self.table.insertRow(row)
-                values = (roll, student, f"{code} — {subject}", internal, assignment, lab, total)
+                values = (class_label, roll, student, f"{code} — {subject}", internal, assignment, lab, total)
                 for col, value in enumerate(values):
                     item = QTableWidgetItem("" if value is None else str(value))
-                    if col == 0:
+                    if col == 1:
                         item.setData(Qt.UserRole, student_id)
                         item.setData(Qt.UserRole + 1, subject_id)
                     self.table.setItem(row, col, item)
@@ -105,14 +121,14 @@ class AcademicTrackerWidget(QWidget):
 
     def _select_record(self):
         row = self.table.currentRow()
-        if row < 0 or not self.table.item(row, 0):
+        if row < 0 or not self.table.item(row, 1):
             return
-        self.selected_student_id = self.table.item(row, 0).data(Qt.UserRole)
-        self.selected_subject_id = self.table.item(row, 0).data(Qt.UserRole + 1)
+        self.selected_student_id = self.table.item(row, 1).data(Qt.UserRole)
+        self.selected_subject_id = self.table.item(row, 1).data(Qt.UserRole + 1)
         self.selected_label.setText(
-            f"{self.table.item(row, 1).text()} · {self.table.item(row, 2).text()}"
+            f"{self.table.item(row, 2).text()} · {self.table.item(row, 3).text()}"
         )
-        for index, column in enumerate((3, 4, 5)):
+        for index, column in enumerate((4, 5, 6)):
             value = self.table.item(row, column).text()
             self.mark_inputs[index].setValue(float(value) if value else 0)
             self.mark_inputs[index].setEnabled(True)

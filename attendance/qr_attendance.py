@@ -14,13 +14,15 @@ class QRAttendanceSystem:
     def __init__(self):
         self.secret_key = get_or_create_app_secret("attendance_qr_hmac_key")
 
-    def generate_token(self, subject_id: int, date_str: str, faculty_id: int = 0, section: str = "C") -> str:
+    def generate_token(self, subject_id: int, date_str: str, faculty_id: int = 0,
+                       section: str = "C", class_id: int | None = None) -> str:
         if date_str != date.today().isoformat():
             raise ValueError("QR attendance can only be opened for today's class.")
         expiry = int(time.time()) + self.TOKEN_TTL_SECONDS
         if not section or ":" in section:
             raise ValueError("Choose a valid class section before opening QR check-in.")
-        payload = f"{subject_id}:{date_str}:{expiry}:{faculty_id}:{section}"
+        section_token = f"@{int(class_id)}" if class_id is not None else section
+        payload = f"{subject_id}:{date_str}:{expiry}:{faculty_id}:{section_token}"
         signature = hmac.new(self.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
         return f"{self.TOKEN_PREFIX}:{payload}:{signature}"
 
@@ -39,8 +41,10 @@ class QRAttendanceSystem:
             )
             if not valid:
                 return {"valid": False, "error": "This attendance code is invalid or has expired."}
+            class_id = int(section[1:]) if section.startswith("@") and section[1:].isdigit() else None
             return {"valid": True, "subject_id": int(subject_id), "date": date_str,
-                    "faculty_id": int(faculty_id), "section": section, "expires_at": expires_at}
+                    "faculty_id": int(faculty_id), "section": section, "class_id": class_id,
+                    "expires_at": expires_at}
         except (ValueError, TypeError):
             return {"valid": False, "error": "This attendance code is invalid or has expired."}
 
@@ -49,5 +53,6 @@ class QRAttendanceSystem:
         if not result["valid"]:
             raise ValueError(result["error"])
         mark_student_attendance_from_qr(
-            user_id, result["subject_id"], result["date"], result["faculty_id"], result["section"]
+            user_id, result["subject_id"], result["date"], result["faculty_id"], result["section"],
+            class_id=result.get("class_id"),
         )

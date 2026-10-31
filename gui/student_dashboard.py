@@ -4,7 +4,8 @@ from PySide6.QtWidgets import (
     QLineEdit, QListWidget, QFileDialog, QScrollArea, QTableWidget,
     QTableWidgetItem, QHeaderView
 )
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices
 from gui.student_attendance import StudentAttendanceWindow
 from gui.academics_widget import AcademicTrackerWidget
 from gui.code_runner_widget import CodeRunnerWidget
@@ -12,28 +13,34 @@ from gui.assignments_widget import AssignmentsWidget
 from gui.notes_qbank_widget import NotesAndQuestionBankWidget
 from gui.notices_widget import NoticesAndRemindersWidget
 from gui.speech_worker import SpeechInputWorker
+from gui.voice_device import MicrophoneSelector
 from gui.voice_notes_widget import VoiceNotesWidget
+from gui.online_student_exam_widget import OnlineStudentExamWidget
 from reports.report_generator import report_generator
 from ai.rag_engine import rag_engine
 from voice.voice_engine import voice_engine
 from voice.commands import execute_voice_intent
 from lab.lab_exam import lab_exam_assistant
 from database.database import (
-    get_student_attendance, get_timetables, get_reminders,
-    get_dashboard_stats_student, get_student_lab_progress, submit_lab_experiment
+    get_student_attendance, get_student_attendance_history, get_timetables, get_reminders,
+    get_dashboard_stats_student, get_student_lab_progress, submit_lab_experiment,
+    get_academic_classes,
 )
+from storage.local_storage import storage_service
 from gui.theme import POSITIVUS_QSS, create_pill_badge, create_section_header, create_content_scroll_area, configure_wrapped_list, COLOR_PRIMARY, COLOR_SECONDARY, COLOR_NEUTRAL_BG, style_action_button
 from voice.speech_input import speech_input_status
 
 
 class StudentDashboard(QMainWindow):
     LAB_EXAM_PAGE_INDEX = 10
+    ONLINE_EXAM_PAGE_INDEX = 11
 
     def __init__(self, user, logout_callback):
         super().__init__()
         self.user = user
         self.logout_callback = logout_callback
         self._exam_active = False
+        self._active_exam_page_index = None
 
         self.setWindowTitle("EduPilot Workspace - Student Portal")
         self.setMinimumSize(1024, 680)
@@ -122,8 +129,9 @@ class StudentDashboard(QMainWindow):
             ("Lab Manuals and Progress", 8),
             ("Timetable / Schedule", 9),
             ("Lab Practical Exam", 10),
-            ("Voice Assistant", 11),
-            ("Voice Notes", 12),
+            ("Online Exams", 11),
+            ("Voice Assistant", 12),
+            ("Voice Notes", 13),
         ]
 
         self.nav_buttons = []
@@ -170,6 +178,7 @@ class StudentDashboard(QMainWindow):
             self._build_ai_tutor_page(), self.code_runner_widget,
             self._build_lab_manuals_page(), self._build_timetable_reminders_page(),
             self._build_lab_exam_page(),
+            OnlineStudentExamWidget(self.user, self),
             self._build_voice_assistant_page(), VoiceNotesWidget(self.user),
         )
         for page in pages:
@@ -181,6 +190,8 @@ class StudentDashboard(QMainWindow):
         self.switch_page(0)
 
     def switch_page(self, index: int):
+        if self._exam_active and index != self._active_exam_page_index:
+            return
         self.stack.setCurrentIndex(index)
         for i, btn in enumerate(self.nav_buttons):
             btn.setChecked(i == index)
@@ -191,7 +202,12 @@ class StudentDashboard(QMainWindow):
         layout.setContentsMargins(28, 24, 28, 24)
 
         student_name = self.user[3]
-        header = create_section_header("Student Workspace", f"Welcome back, {student_name}")
+        class_rows = get_academic_classes(student_user_id=self.user[0])
+        class_label = (
+            f"{class_rows[0][1]} · Year {class_rows[0][2]} · Section {class_rows[0][3]} · {class_rows[0][4]}"
+            if class_rows else "Academic class not assigned"
+        )
+        header = create_section_header("Student Workspace", f"Welcome back, {student_name} · {class_label}")
         layout.addWidget(header)
         layout.addSpacing(16)
 
@@ -335,13 +351,19 @@ class StudentDashboard(QMainWindow):
         list_w = QListWidget()
         configure_wrapped_list(list_w)
         self.attendance_list = list_w
-        summary = get_student_attendance(self.user[0])
-        for code, name, total, present in summary:
-            pct = round((present / total * 100), 1) if total > 0 else None
-            result = f"{pct}%" if pct is not None else "No sessions recorded"
-            list_w.addItem(f"{code} - {name}  |  Attended: {present}/{total} classes ({result})")
-
         layout.addWidget(list_w)
+        layout.addWidget(QLabel("Attendance history"))
+        self.attendance_history_table = QTableWidget()
+        self.attendance_history_table.setColumnCount(4)
+        self.attendance_history_table.setHorizontalHeaderLabels(
+            ["Date", "Subject", "Status", "Verification"]
+        )
+        self.attendance_history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.attendance_history_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.attendance_history_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.attendance_history_table.setMinimumHeight(180)
+        layout.addWidget(self.attendance_history_table)
+        self._refresh_attendance_views()
         layout.addSpacing(12)
 
         layout.addWidget(QLabel("Class QR check-in"))
@@ -376,6 +398,24 @@ class StudentDashboard(QMainWindow):
         if scanner.exec() == QDialog.Accepted and scanner.scanned_text:
             self.attendance_qr_input.setText(scanner.scanned_text)
 
+    def _refresh_attendance_views(self):
+        if hasattr(self, "attendance_list"):
+            summary = get_student_attendance(self.user[0])
+            self.attendance_list.clear()
+            for code, name, total, present in summary:
+                pct = round((present / total * 100), 1) if total > 0 else None
+                result = f"{pct}%" if pct is not None else "No sessions recorded"
+                self.attendance_list.addItem(
+                    f"{code} - {name}  |  Attended: {present}/{total} classes ({result})"
+                )
+        if hasattr(self, "attendance_history_table"):
+            history = get_student_attendance_history(self.user[0])
+            self.attendance_history_table.setRowCount(len(history))
+            for row, (class_date, code, name, status, method) in enumerate(history):
+                values = (str(class_date), f"{code} - {name}", status, method.title())
+                for column, value in enumerate(values):
+                    self.attendance_history_table.setItem(row, column, QTableWidgetItem(value))
+
     def _submit_attendance_qr(self):
         token = self.attendance_qr_input.text().strip()
         if not token:
@@ -386,11 +426,7 @@ class StudentDashboard(QMainWindow):
             QRAttendanceSystem().record_attendance(self.user[0], token)
             self.attendance_qr_input.clear()
             QMessageBox.information(self, "Attendance", "Your attendance has been recorded.")
-            self.attendance_list.clear()
-            for code, name, total, present in get_student_attendance(self.user[0]):
-                pct = round((present / total * 100), 1) if total else None
-                result = f"{pct}%" if pct is not None else "No sessions recorded"
-                self.attendance_list.addItem(f"{code} - {name}  |  Attended: {present}/{total} classes ({result})")
+            self._refresh_attendance_views()
             self.switch_page(1)
         except Exception as error:
             QMessageBox.warning(self, "Attendance code", str(error))
@@ -400,7 +436,7 @@ class StudentDashboard(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(24, 20, 24, 20)
 
-        layout.addWidget(create_section_header("AI Study Assistant & Local RAG", "Ask questions from uploaded course materials"))
+        layout.addWidget(create_section_header("AI Study Assistant", "Ask questions about your uploaded course materials"))
         layout.addSpacing(12)
 
         self.query_input = QLineEdit()
@@ -434,9 +470,22 @@ class StudentDashboard(QMainWindow):
     def _on_ask_tutor(self):
         text = self.query_input.text().strip()
         if not text:
+            self.tutor_output.setPlainText("Enter a question about your course, notes, timetable, or exam notices.")
             return
-        res = rag_engine.query(text, role="student")
-        self.tutor_output.setPlainText(f"Answer:\n{res['answer']}\n\n[Source: {res['source']}]")
+        try:
+            res = rag_engine.query(text, role="student", user_id=self.user[0])
+        except Exception as error:
+            self.tutor_output.setPlainText(f"The local study assistant could not search its materials.\n\nDetails: {error}")
+            return
+        citations = res.get("citations", [])
+        source_text = "\n".join(
+            f"• {item['source']}" + (f" — page {item['page']}" if item.get("page") else "")
+            for item in citations
+        ) or res.get("source", "No source")
+        self.tutor_output.setPlainText(
+            f"Answer from approved local material:\n{res['answer']}\n\n"
+            f"Sources:\n{source_text}\n\nConfidence: {res.get('confidence', 'Low')}"
+        )
 
     def _build_lab_manuals_page(self) -> QWidget:
         page = QWidget()
@@ -456,12 +505,17 @@ class StudentDashboard(QMainWindow):
         self.lab_description = QLabel("Select an experiment to view its instructions.")
         self.lab_description.setWordWrap(True)
         layout.addWidget(self.lab_description)
+        self.lab_open_manual_button = QPushButton("Open Reference Manual")
+        self.lab_open_manual_button.setEnabled(False)
+        self.lab_open_manual_button.clicked.connect(self._open_lab_manual)
+        layout.addWidget(self.lab_open_manual_button, 0, Qt.AlignLeft)
         self.lab_work_input = QTextEdit()
         self.lab_work_input.setPlaceholderText("Describe your solution or paste a short work summary for faculty review.")
         self.lab_work_input.setMinimumHeight(110)
         layout.addWidget(self.lab_work_input)
         self.lab_submit_button = QPushButton("Submit Lab Work for Review")
         self.lab_submit_button.setEnabled(False)
+        self.lab_open_manual_button.setEnabled(False)
         self.lab_submit_button.clicked.connect(self._submit_lab_work)
         layout.addWidget(self.lab_submit_button)
         self._refresh_lab_progress()
@@ -491,6 +545,20 @@ class StudentDashboard(QMainWindow):
             self.lab_work_input.setPlainText(experiment[7])
             self.lab_work_input.setReadOnly(experiment[6] == "Completed")
             self.lab_submit_button.setEnabled(experiment[6] != "Completed")
+            manual_path = experiment[8] if len(experiment) > 8 else None
+            self.lab_open_manual_button.setEnabled(bool(manual_path))
+            self._selected_lab_manual = manual_path
+
+    def _open_lab_manual(self):
+        reference = getattr(self, "_selected_lab_manual", None)
+        if not reference:
+            return
+        try:
+            path = storage_service.resolve(reference)
+            if not path.is_file() or not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))):
+                QMessageBox.warning(self, "Manual unavailable", "The lab manual could not be opened on this device.")
+        except Exception as error:
+            QMessageBox.warning(self, "Manual unavailable", str(error))
 
     def _submit_lab_work(self):
         row = self.lab_progress_table.currentRow()
@@ -514,7 +582,7 @@ class StudentDashboard(QMainWindow):
 
         list_w = QListWidget()
         configure_wrapped_list(list_w)
-        tt = get_timetables()
+        tt = get_timetables(student_user_id=self.user[0])
         for t in tt:
             list_w.addItem(f"{t[3]} | {t[4]} - {t[5]} | {t[1]} ({t[2]}) in {t[6]}")
 
@@ -651,6 +719,7 @@ class StudentDashboard(QMainWindow):
             self.exam_solution.blockSignals(False)
             self.exam_seconds_remaining = remaining
             self._exam_active = True
+            self._active_exam_page_index = self.LAB_EXAM_PAGE_INDEX
             self.exam_solution.setEnabled(True)
             self.exam_submit_button.setEnabled(True)
             self.exam_start_button.setEnabled(False)
@@ -712,6 +781,7 @@ class StudentDashboard(QMainWindow):
                 self.exam_save_status.setText(f"Reconnect and contact faculty with this message: {error}")
             self.exam_timer.stop()
             self._exam_active = False
+            self._active_exam_page_index = None
             self.exam_solution.setEnabled(False)
             self.exam_submit_button.setEnabled(False)
             self.exam_return_button.setVisible(True)
@@ -724,16 +794,19 @@ class StudentDashboard(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(24, 20, 24, 20)
-        layout.addWidget(create_section_header("Voice Command Console", "Type a phrase to use offline course and reminder commands"))
+        layout.addWidget(create_section_header("Voice Assistant", "Choose your microphone, check its level, then speak a short command and pause"))
         self.voice_command_input = QLineEdit()
-        self.voice_command_input.setPlaceholderText("Try: read schedule, read reminders, or ask a course question")
+        self.voice_command_input.setPlaceholderText("Try: search for a file, find an app, or ask a course question")
         run_button = QPushButton("Process command")
         run_button.setProperty("class", "secondary")
         run_button.clicked.connect(self._run_student_voice_command)
         layout.addWidget(self.voice_command_input)
         layout.addWidget(run_button)
+        self.microphone_selector = MicrophoneSelector(self)
+        self.microphone_selector.device_combo.currentIndexChanged.connect(self._refresh_speech_device_status)
+        layout.addWidget(self.microphone_selector)
         microphone_row = QHBoxLayout()
-        speech_ready, speech_message = speech_input_status()
+        speech_ready, speech_message = speech_input_status(self.microphone_selector.selected_device)
         self.speech_status_label = QLabel(speech_message)
         self.speech_status_label.setWordWrap(True)
         self.speech_status_label.setStyleSheet("color: #687782; font-size: 12px;")
@@ -794,6 +867,12 @@ class StudentDashboard(QMainWindow):
             result = intent["reply"]
         elif intent.get("intent") == "start_timer":
             result = intent.get("reply", "The timer could not be started.")
+        elif intent.get("intent") == "open_course_material":
+            from gui.voice_actions import open_course_material
+            result = open_course_material(self, intent.get("query", ""))
+        elif intent.get("intent") == "search_local_item":
+            from gui.voice_actions import search_local_item
+            result = search_local_item(self, intent.get("query", ""), intent.get("kind", "all"))
         elif intent.get("intent") in {"run_python", "compile_java"}:
             language = "Python" if intent["intent"] == "run_python" else "Java"
             self.code_runner_widget.lang_combo.setCurrentText(language)
@@ -817,7 +896,7 @@ class StudentDashboard(QMainWindow):
     def _start_speech_input(self):
         if self.speech_worker and self.speech_worker.isRunning():
             return
-        ready, explanation = speech_input_status()
+        ready, explanation = speech_input_status(self.microphone_selector.selected_device)
         if not ready:
             self.speech_status_label.setText(explanation)
             return
@@ -826,11 +905,26 @@ class StudentDashboard(QMainWindow):
         self.speech_status_label.setText("Listening offline… say a command, then pause.")
         self.speech_start_button.setEnabled(False)
         self.speech_stop_button.setEnabled(True)
-        self.speech_worker = SpeechInputWorker(self, command_mode=True)
+        self.microphone_selector.set_level(0)
+        self.speech_worker = SpeechInputWorker(
+            self, command_mode=True, input_device=self.microphone_selector.selected_device
+        )
+        self.speech_worker.partial_text.connect(self._show_speech_partial)
+        self.speech_worker.audio_level.connect(self.microphone_selector.set_level)
         self.speech_worker.phrase_recognized.connect(self._process_spoken_command)
         self.speech_worker.failed.connect(self._speech_input_failed)
         self.speech_worker.finished.connect(self._speech_input_finished)
         self.speech_worker.start()
+
+    def _show_speech_partial(self, phrase: str):
+        if phrase:
+            self.voice_command_input.setText(phrase)
+            self.speech_status_label.setText(f"Hearing: “{phrase}”…")
+
+    def _refresh_speech_device_status(self):
+        ready, message = speech_input_status(self.microphone_selector.selected_device)
+        self.speech_status_label.setText(message)
+        self.speech_start_button.setEnabled(ready and not (self.speech_worker and self.speech_worker.isRunning()))
 
     def _process_spoken_command(self, phrase: str):
         self.last_spoken_phrase = phrase
@@ -849,9 +943,10 @@ class StudentDashboard(QMainWindow):
         self.speech_error = message
 
     def _speech_input_finished(self):
-        ready, explanation = speech_input_status()
+        ready, explanation = speech_input_status(self.microphone_selector.selected_device)
         self.speech_start_button.setEnabled(ready)
         self.speech_stop_button.setEnabled(False)
+        self.microphone_selector.set_level(0)
         if self.last_spoken_phrase and not self.speech_error:
             self.speech_status_label.setText("Review the recognized text and select Process command.")
         else:
@@ -925,6 +1020,7 @@ class StudentDashboard(QMainWindow):
             self.exam_timer.stop()
             self.exam_draft_timer.stop()
             self._exam_active = False
+            self._active_exam_page_index = None
             self.exam_clock_label.setText("Submitted. Faculty evaluation is pending.")
             self.exam_save_status.setText("Submitted successfully. Faculty evaluation is pending.")
             self.exam_return_button.setVisible(True)

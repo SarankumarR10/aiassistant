@@ -10,7 +10,8 @@ from database.database import (
     add_announcement,
     get_reminders,
     add_reminder,
-    toggle_reminder_completed
+    toggle_reminder_completed,
+    get_academic_classes,
 )
 from gui.theme import POSITIVUS_QSS, create_section_header, configure_wrapped_list
 
@@ -46,6 +47,28 @@ class NoticesAndRemindersWidget(QWidget):
         ann_title.setStyleSheet("font-size: 14px; font-weight: 700; color: #0F172A;")
         left_layout.addWidget(ann_title)
 
+        announcement_filters = QHBoxLayout()
+        self.announcement_search = QLineEdit()
+        self.announcement_search.setPlaceholderText("Search notices by title or content")
+        self.announcement_search.textChanged.connect(self._render_announcements)
+        self.announcement_class_filter = QComboBox()
+        self.announcement_class_filter.addItem("All my classes", None)
+        classes = get_academic_classes(
+            faculty_id=self.user[0] if self.role == "faculty" else None,
+            student_user_id=self.user[0] if self.role == "student" else None,
+        )
+        for class_row in classes:
+            class_label = f"{class_row[1]} · Year {class_row[2]} · Section {class_row[3]}"
+            self.announcement_class_filter.addItem(class_label, class_row[0])
+        self.announcement_class_filter.currentIndexChanged.connect(self._render_announcements)
+        self.refresh_announcements_button = QPushButton("Refresh")
+        self.refresh_announcements_button.setProperty("class", "outline")
+        self.refresh_announcements_button.clicked.connect(self.load_announcements)
+        announcement_filters.addWidget(self.announcement_search, 1)
+        announcement_filters.addWidget(self.announcement_class_filter)
+        announcement_filters.addWidget(self.refresh_announcements_button)
+        left_layout.addLayout(announcement_filters)
+
         self.list_announcements = QListWidget()
         configure_wrapped_list(self.list_announcements)
         left_layout.addWidget(self.list_announcements)
@@ -72,6 +95,13 @@ class NoticesAndRemindersWidget(QWidget):
 
             self.combo_audience = QComboBox()
             self.combo_audience.addItems(["All", "Students", "Faculty"])
+            self.class_picker = QComboBox()
+            self.class_picker.addItem("All classes", None)
+            for class_row in get_academic_classes(faculty_id=self.user[0]):
+                self.class_picker.addItem(
+                    f"{class_row[1]} · Year {class_row[2]} · Section {class_row[3]} · {class_row[4]}",
+                    class_row[0],
+                )
 
             self.input_ann_content = QTextEdit()
             self.input_ann_content.setPlaceholderText("Announcement Body...")
@@ -84,6 +114,8 @@ class NoticesAndRemindersWidget(QWidget):
 
             pf.addWidget(self.input_ann_title)
             pf.addWidget(self.combo_audience)
+            pf.addWidget(QLabel("Class (optional)"))
+            pf.addWidget(self.class_picker)
             pf.addWidget(self.input_ann_content)
             pf.addWidget(btn_post)
             left_layout.addWidget(post_frame)
@@ -99,9 +131,24 @@ class NoticesAndRemindersWidget(QWidget):
         rem_title.setStyleSheet("font-size: 14px; font-weight: 700; color: #0F172A;")
         right_layout.addWidget(rem_title)
 
+        reminder_filters = QHBoxLayout()
+        self.reminder_status_filter = QComboBox()
+        self.reminder_status_filter.addItem("All reminders", None)
+        self.reminder_status_filter.addItem("Pending", False)
+        self.reminder_status_filter.addItem("Completed", True)
+        self.reminder_status_filter.currentIndexChanged.connect(self._render_reminders)
+        self.toggle_reminder_button = QPushButton("Mark selected complete")
+        self.toggle_reminder_button.setProperty("class", "outline")
+        self.toggle_reminder_button.setEnabled(False)
+        self.toggle_reminder_button.clicked.connect(self._toggle_selected_reminder)
+        reminder_filters.addWidget(self.reminder_status_filter, 1)
+        reminder_filters.addWidget(self.toggle_reminder_button)
+        right_layout.addLayout(reminder_filters)
+
         self.list_reminders = QListWidget()
         configure_wrapped_list(self.list_reminders)
         self.list_reminders.itemDoubleClicked.connect(self._toggle_reminder)
+        self.list_reminders.itemSelectionChanged.connect(self._update_reminder_button)
         right_layout.addWidget(self.list_reminders)
 
         rem_frame = QFrame()
@@ -150,12 +197,25 @@ class NoticesAndRemindersWidget(QWidget):
         self.load_reminders()
 
     def load_announcements(self):
-        anns = get_announcements(self.role)
+        self.announcements = get_announcements(self.role, user_id=self.user[0])
+        self._render_announcements()
+
+    def _render_announcements(self, *_):
+        anns = getattr(self, "announcements", [])
+        search = self.announcement_search.text().strip().casefold()
+        selected_class = self.announcement_class_filter.currentData()
         self.list_announcements.clear()
         for a in anns:
+            if selected_class is not None and a[6] not in (None, selected_class):
+                continue
+            if search and search not in f"{a[2]} {a[3]} {a[1]}".casefold():
+                continue
             created = a[5] if len(a) > 5 else "Recent"
-            item_text = f"Notice: {a[2]}  [Audience: {a[4]} | Author: {a[1]} - {created}]\n   {a[3]}"
+            class_label = f"{a[7]} Year {a[8]} Section {a[9]} · {a[10]}" if len(a) > 10 and a[7] else "All classes"
+            item_text = f"Notice: {a[2]}  [Audience: {a[4]} | {class_label} | Author: {a[1]} - {created}]\n   {a[3]}"
             self.list_announcements.addItem(item_text)
+        if self.list_announcements.count() == 0:
+            self.list_announcements.addItem("No notices match these filters.")
 
     def _post_announcement(self):
         title = self.input_ann_title.text().strip()
@@ -166,7 +226,7 @@ class NoticesAndRemindersWidget(QWidget):
 
         add_announcement(
             faculty_id=self.user[0], title=title, content=body,
-            target_group=self.combo_audience.currentText(),
+            target_group=self.combo_audience.currentText(), class_id=self.class_picker.currentData(),
         )
         QMessageBox.information(self, "Success", "Announcement posted successfully!")
         self.input_ann_title.clear()
@@ -174,12 +234,35 @@ class NoticesAndRemindersWidget(QWidget):
         self.load_announcements()
 
     def load_reminders(self):
-        rems = get_reminders(self.user[0])
-        self.current_rems = rems
+        self.current_rems = get_reminders(self.user[0])
+        self._render_reminders()
+
+    def _render_reminders(self, *_):
         self.list_reminders.clear()
-        for r in rems:
+        completed_filter = self.reminder_status_filter.currentData()
+        for r in self.current_rems:
+            if completed_filter is not None and bool(r[4]) != completed_filter:
+                continue
             status = "Completed" if r[4] else "Pending"
-            self.list_reminders.addItem(f"[{r[2]}] {r[1]} (Due: {r[3]}) - Status: {status} (Double click to toggle)")
+            item = QListWidgetItem(f"[{r[2]}] {r[1]} (Due: {r[3]}) · {status}")
+            item.setData(Qt.UserRole, r[0])
+            self.list_reminders.addItem(item)
+        if self.list_reminders.count() == 0:
+            self.list_reminders.addItem("No reminders match this filter.")
+        self._update_reminder_button()
+
+    def _update_reminder_button(self):
+        item = self.list_reminders.currentItem()
+        reminder_id = item.data(Qt.UserRole) if item else None
+        reminder = next((row for row in getattr(self, "current_rems", [])
+                         if row[0] == reminder_id), None)
+        if reminder:
+            label = "Mark selected pending" if reminder[4] else "Mark selected complete"
+            self.toggle_reminder_button.setText(label)
+        self.toggle_reminder_button.setEnabled(reminder is not None)
+
+    def _toggle_selected_reminder(self):
+        self._toggle_reminder(self.list_reminders.currentItem())
 
     def _add_reminder(self):
         text = self.input_rem_text.text().strip()
@@ -203,8 +286,9 @@ class NoticesAndRemindersWidget(QWidget):
         self.load_reminders()
 
     def _toggle_reminder(self, item: QListWidgetItem):
-        row = self.list_reminders.row(item)
-        if hasattr(self, 'current_rems') and row < len(self.current_rems):
-            rem_id = self.current_rems[row][0]
+        if item is None:
+            return
+        rem_id = item.data(Qt.UserRole)
+        if rem_id is not None:
             toggle_reminder_completed(rem_id, self.user[0])
             self.load_reminders()

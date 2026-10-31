@@ -4,8 +4,10 @@ import hmac
 import os
 import secrets
 import sys
+import base64
+import json
 from contextlib import closing
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -131,8 +133,55 @@ def initialize_local_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_voice_notes_owner_updated
                 ON voice_notes(user_id, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS face_enrollments (
+                student_id INTEGER PRIMARY KEY,
+                encrypted_samples TEXT NOT NULL,
+                consented_by INTEGER NOT NULL,
+                consented_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
         """)
         connection.commit()
+
+
+def _clear_local_demo_data_once(version: str) -> None:
+    """Clear private device records once after the shared academic reset."""
+    with closing(get_local_connection()) as connection:
+        connection.execute("CREATE TABLE IF NOT EXISTS local_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        row = connection.execute("SELECT value FROM local_settings WHERE name='application_data_reset_version'").fetchone()
+        if row and row[0] == version:
+            return
+        connection.execute("DELETE FROM voice_notes")
+        connection.execute("DELETE FROM face_enrollments")
+        connection.execute("DELETE FROM local_settings")
+        connection.execute("INSERT INTO local_settings(name,value) VALUES('application_data_reset_version',?)", (version,))
+        connection.commit()
+    try:
+        import keyring
+        keyring.delete_password("EduPilot", "face_encryption_key")
+    except Exception:
+        pass
+
+
+def purge_face_enrollments() -> int:
+    """Remove expired templates and templates whose student account was deleted."""
+    shared = get_connection()
+    try:
+        live_ids = [row[0] for row in shared.execute("SELECT id FROM students").fetchall()]
+    finally:
+        shared.close()
+    cutoff = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with closing(get_local_connection()) as local:
+        if live_ids:
+            marks = ",".join("?" for _ in live_ids)
+            cursor = local.execute(
+                f"DELETE FROM face_enrollments WHERE expires_at <= ? OR student_id NOT IN ({marks})",
+                (cutoff, *live_ids),
+            )
+        else:
+            cursor = local.execute("DELETE FROM face_enrollments")
+        local.commit()
+        return cursor.rowcount
 
 
 def _ensure_column(cursor, table: str, column: str, declaration: str) -> None:
@@ -149,6 +198,186 @@ def _ensure_column(cursor, table: str, column: str, declaration: str) -> None:
         present = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
     if column not in present:
         cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
+def current_academic_year() -> str:
+    """Return the conventional July-to-June academic year label."""
+    today = date.today()
+    start = today.year if today.month >= 7 else today.year - 1
+    return f"{start}-{start + 1}"
+
+
+def _get_or_create_academic_class(cursor, department: str, year: int, section: str,
+                                  academic_year: str | None = None) -> int:
+    department = str(department or "General").strip() or "General"
+    section = str(section or "A").strip() or "A"
+    year = int(year)
+    academic_year = str(academic_year or current_academic_year()).strip()
+    cursor.execute("""INSERT OR IGNORE INTO academic_classes
+        (department, year_of_study, section, academic_year) VALUES (?, ?, ?, ?)""",
+        (department, year, section, academic_year))
+    return int(cursor.execute("""SELECT id FROM academic_classes WHERE department = ?
+        AND year_of_study = ? AND section = ? AND academic_year = ?""",
+        (department, year, section, academic_year)).fetchone()[0])
+
+
+def _remove_seed_student(cursor, username: str) -> None:
+    """Remove a retired built-in demo student and its dependent records."""
+    user = cursor.execute("SELECT id FROM users WHERE username = ? AND role = 'student'", (username,)).fetchone()
+    if not user:
+        return
+    user_id = int(user[0])
+    student = cursor.execute("SELECT id FROM students WHERE user_id = ?", (user_id,)).fetchone()
+    if student:
+        student_id = int(student[0])
+        for table in ("attendance_records", "academics", "assignment_submissions",
+                      "lab_submissions", "lab_exam_submissions", "online_exam_attempts"):
+            cursor.execute(f"DELETE FROM {table} WHERE student_id = ?", (student_id,))
+        cursor.execute("DELETE FROM students WHERE id = ?", (student_id,))
+    cursor.execute("DELETE FROM assistant_query_events WHERE user_id = ?", (user_id,))
+    cursor.execute("DELETE FROM reminders WHERE user_id = ?", (user_id,))
+    cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+
+def _reset_shared_application_data_once(cursor) -> bool:
+    """Replace existing academic records once with the approved demo cohort."""
+    version = "1"
+    marker = cursor.execute("SELECT value FROM app_settings WHERE name='application_data_reset_version'").fetchone()
+    if marker and marker[0] == version:
+        return False
+
+    # Delete children before parents so SQLite and PostgreSQL enforce the same
+    # reset. The subject and curated FAQ catalogs remain as app reference data.
+    tables = (
+        "online_exam_results", "online_exam_faculty_actions", "online_exam_violations",
+        "online_code_submissions", "online_attempt_questions", "online_student_answers",
+        "online_exam_attempts", "online_exam_questions", "online_question_options",
+        "online_coding_test_cases", "online_questions", "online_exams",
+        "lab_exam_submissions", "lab_submissions", "assignment_submissions",
+        "attendance_records", "academics", "document_chunks", "reminders",
+        "assistant_query_events", "audit_log", "announcements",
+        "assignments", "notes", "documents", "question_banks", "lab_experiments",
+        "lab_exams", "timetables", "attendance_sessions", "teaching_assignments",
+        "faculty_profiles", "students", "academic_classes", "users",
+    )
+    for table in tables:
+        cursor.execute(f"DELETE FROM {table}")
+    cursor.execute("DELETE FROM subjects")
+    cursor.execute("DELETE FROM app_settings WHERE name='academic_demo_seed_version'")
+    cursor.execute("INSERT OR REPLACE INTO app_settings(name,value) VALUES('application_data_reset_version',?)",
+                   (version,))
+    return True
+
+
+def _seed_academic_demo_data(cursor) -> None:
+    """Replace the built-in sample cohort once with class-scoped demo users."""
+    version = "1"
+    row = cursor.execute("SELECT value FROM app_settings WHERE name = 'academic_demo_seed_version'").fetchone()
+    if row and row[0] == version:
+        return
+
+    # Keep historical rows attached to the original faculty ID.
+    legacy_faculty = cursor.execute("SELECT id FROM users WHERE username='faculty' AND role='faculty'").fetchone()
+    numbered_faculty = cursor.execute("SELECT id FROM users WHERE username='faculty1'").fetchone()
+    if legacy_faculty and not numbered_faculty:
+        cursor.execute("UPDATE users SET username='faculty1' WHERE id=?", (legacy_faculty[0],))
+    for old_name in ("student4", "student5"):
+        _remove_seed_student(cursor, old_name)
+
+    faculty_seed = (
+        ("faculty1", "Dr. Meera Raman", "FAC-CSE-001", "Computer Science", "Assistant Professor"),
+        ("faculty2", "Prof. Arjun Menon", "FAC-CSE-002", "Computer Science", "Associate Professor"),
+        ("faculty3", "Dr. Priya Nair", "FAC-CSE-003", "Computer Science", "Assistant Professor"),
+    )
+    faculty_ids = {}
+    for username, name, employee_code, department, designation in faculty_seed:
+        found = cursor.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if found:
+            faculty_id = int(found[0])
+            cursor.execute("UPDATE users SET password=?, role='faculty', name=? WHERE id=?",
+                           (hash_password("Faculty123!"), name, faculty_id))
+        else:
+            cursor.execute("INSERT INTO users(username,password,role,name) VALUES(?,?,?,?)",
+                           (username, hash_password("Faculty123!"), "faculty", name))
+            faculty_id = int(cursor.lastrowid)
+        faculty_ids[username] = faculty_id
+        cursor.execute("""INSERT INTO faculty_profiles(user_id,employee_code,department,designation)
+            VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET employee_code=excluded.employee_code,
+            department=excluded.department, designation=excluded.designation""",
+            (faculty_id, employee_code, department, designation))
+
+    # Convert the original student login to student1 while retaining its row.
+    old_student = cursor.execute("SELECT id FROM users WHERE username='student' AND role='student'").fetchone()
+    numbered_student = cursor.execute("SELECT id FROM users WHERE username='student1'").fetchone()
+    if old_student and not numbered_student:
+        cursor.execute("UPDATE users SET username='student1' WHERE id=?", (old_student[0],))
+
+    academic_year = current_academic_year()
+    class_one = _get_or_create_academic_class(cursor, "CSE", 1, "A", academic_year)
+    class_two = _get_or_create_academic_class(cursor, "CSE", 2, "A", academic_year)
+    cursor.execute("UPDATE academic_classes SET created_by=? WHERE id=?", (faculty_ids["faculty1"], class_one))
+    cursor.execute("UPDATE academic_classes SET created_by=? WHERE id=?", (faculty_ids["faculty1"], class_two))
+
+    student_seed = (
+        ("student1", "Asha Kumar", "26CSE001", 1, class_one),
+        ("student2", "Kavin Raj", "26CSE002", 1, class_one),
+        ("student3", "Nila Devi", "25CSE001", 2, class_two),
+    )
+    for username, name, roll_number, year, class_id in student_seed:
+        found = cursor.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if found:
+            user_id = int(found[0])
+            cursor.execute("UPDATE users SET password=?, role='student', name=? WHERE id=?",
+                           (hash_password("Student123!"), name, user_id))
+        else:
+            cursor.execute("INSERT INTO users(username,password,role,name) VALUES(?,?,?,?)",
+                           (username, hash_password("Student123!"), "student", name))
+            user_id = int(cursor.lastrowid)
+        student = cursor.execute("SELECT id FROM students WHERE user_id=?", (user_id,)).fetchone()
+        if student:
+            cursor.execute("""UPDATE students SET roll_number=?,name=?,department='CSE',year=?,
+                section='A',class_id=? WHERE id=?""",
+                (roll_number, name, year, class_id, student[0]))
+        else:
+            cursor.execute("""INSERT INTO students(user_id,roll_number,name,department,year,section,class_id)
+                VALUES(?,?,?,'CSE',?,'A',?)""", (user_id, roll_number, name, year, class_id))
+
+    for code, name in (("CS301", "Data Structures"), ("CS302", "Database Management Systems"),
+                       ("CS303", "Computer Networks"), ("CS304", "Python Programming")):
+        cursor.execute("INSERT OR IGNORE INTO subjects(code,name) VALUES(?,?)", (code, name))
+    subject_ids = {record[1]: int(record[0]) for record in cursor.execute("SELECT id,code FROM subjects").fetchall()}
+    allocations = (
+        (class_one, "CS303", "faculty2"), (class_one, "CS304", "faculty3"),
+        (class_two, "CS301", "faculty1"), (class_two, "CS302", "faculty2"),
+    )
+    for class_id, code, faculty_name in allocations:
+        subject_id = subject_ids.get(code)
+        if subject_id is not None:
+            cursor.execute("""INSERT INTO teaching_assignments(class_id,subject_id,faculty_id,academic_term)
+                VALUES(?,?,?,'Full Year') ON CONFLICT(class_id,subject_id,academic_term)
+                DO UPDATE SET faculty_id=excluded.faculty_id""",
+                (class_id, subject_id, faculty_ids[faculty_name]))
+
+    # Link legacy course data only when the current allocation identifies one class.
+    for table in ("assignments", "notes", "documents", "question_banks", "lab_experiments",
+                  "lab_exams", "online_exams"):
+        rows = cursor.execute(f"SELECT id,subject_id FROM {table} WHERE class_id IS NULL").fetchall()
+        for record_id, subject_id in rows:
+            offered = cursor.execute("SELECT DISTINCT class_id FROM teaching_assignments WHERE subject_id=?",
+                                     (subject_id,)).fetchall()
+            if len(offered) == 1:
+                cursor.execute(f"UPDATE {table} SET class_id=? WHERE id=?", (offered[0][0], record_id))
+    cursor.execute("""UPDATE assignments SET faculty_id=(SELECT ta.faculty_id FROM teaching_assignments ta
+        WHERE ta.class_id=assignments.class_id AND ta.subject_id=assignments.subject_id LIMIT 1)
+        WHERE faculty_id IS NULL AND class_id IS NOT NULL""")
+    for record_id, subject_id in cursor.execute("SELECT id,subject_id FROM timetables WHERE class_id IS NULL").fetchall():
+        offered = cursor.execute("SELECT class_id,faculty_id FROM teaching_assignments WHERE subject_id=?",
+                                 (subject_id,)).fetchall()
+        if len({record[0] for record in offered}) == 1:
+            cursor.execute("UPDATE timetables SET class_id=?,faculty_id=? WHERE id=?",
+                           (offered[0][0], offered[0][1], record_id))
+
+    cursor.execute("INSERT OR REPLACE INTO app_settings(name,value) VALUES('academic_demo_seed_version',?)", (version,))
 
 
 def get_or_create_app_secret(name: str) -> str:
@@ -192,6 +421,187 @@ def get_or_create_app_secret(name: str) -> str:
         return row[0]
     finally:
         conn.close()
+
+
+def _local_face_cipher():
+    """Return a Fernet cipher keyed by the operating system credential vault."""
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError as error:
+        raise RuntimeError(
+            "Encrypted face enrollment needs cryptography. Install the optional project requirements and restart EduPilot."
+        ) from error
+    try:
+        import keyring
+    except ImportError as error:
+        raise RuntimeError(
+            "Face enrollment needs the optional keyring package to protect its encryption key in the OS credential vault."
+        ) from error
+
+    service, username = "EduPilot", "face_encryption_key"
+    try:
+        backend = keyring.get_keyring()
+        if getattr(backend, "priority", 0) <= 0:
+            raise RuntimeError("No secure OS credential vault is available on this device.")
+        value = keyring.get_password(service, username)
+    except RuntimeError:
+        raise
+    except Exception as error:
+        raise RuntimeError(f"Could not access the OS credential vault: {error}") from error
+
+    conn = get_local_connection()
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS local_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        legacy = conn.execute("SELECT value FROM local_settings WHERE name = ?", (username,)).fetchone()
+        if not value:
+            value = legacy[0] if legacy else base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+            try:
+                keyring.set_password(service, username, value)
+                if keyring.get_password(service, username) != value:
+                    raise RuntimeError("The OS credential vault did not retain the face encryption key.")
+            except RuntimeError:
+                raise
+            except Exception as error:
+                raise RuntimeError(f"Could not save the face encryption key in the OS credential vault: {error}") from error
+        conn.execute("DELETE FROM local_settings WHERE name = ?", (username,))
+        conn.commit()
+        try:
+            return Fernet(value.encode("ascii"))
+        except (ValueError, TypeError) as error:
+            raise RuntimeError("The face encryption key in the OS credential vault is invalid.") from error
+    finally:
+        conn.close()
+
+
+def save_student_face_enrollment(student_id: int, samples: list[str], faculty_id: int,
+                                 consent_confirmed: bool) -> str:
+    """Store encrypted face crops locally for 90 days after explicit opt-in confirmation."""
+    if not consent_confirmed:
+        raise PermissionError("Confirm that this student has opted in before saving face enrollment.")
+    if not samples or len(samples) < 5 or len(samples) > 20:
+        raise ValueError("Capture between 5 and 20 clear face samples.")
+    if any(not isinstance(sample, str) or len(sample) > 200_000 for sample in samples):
+        raise ValueError("A face sample is invalid or too large.")
+
+    conn = get_connection()
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        student = conn.execute("SELECT 1 FROM students WHERE id = ?", (student_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can enroll a student face.")
+        if not student:
+            raise ValueError("The selected student no longer exists.")
+    finally:
+        conn.close()
+
+    cipher = _local_face_cipher()
+    now = datetime.now(timezone.utc)
+    consented_at = now.isoformat(timespec="seconds")
+    expires_at = (now + timedelta(days=90)).isoformat(timespec="seconds")
+    encrypted = cipher.encrypt(json.dumps(samples, separators=(",", ":")).encode("utf-8")).decode("ascii")
+    with closing(get_local_connection()) as local:
+        local.execute("""
+            INSERT INTO face_enrollments(student_id, encrypted_samples, consented_by, consented_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(student_id) DO UPDATE SET encrypted_samples = excluded.encrypted_samples,
+                consented_by = excluded.consented_by, consented_at = excluded.consented_at,
+                expires_at = excluded.expires_at
+        """, (student_id, encrypted, faculty_id, consented_at, expires_at))
+        local.commit()
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        _audit(cursor, faculty_id, "attendance.face_enrolled", f"student={student_id}; expires={expires_at[:10]}")
+        conn.commit()
+    finally:
+        conn.close()
+    return expires_at
+
+
+def get_student_face_enrollments(section: str, faculty_id: int,
+                                class_id: int | None = None) -> list[tuple[int, list[str]]]:
+    """Load active face samples only for a faculty-authorized section on this device."""
+    conn = get_connection()
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can use face attendance.")
+        if class_id is not None:
+            student_ids = [row[0] for row in conn.execute("SELECT id FROM students WHERE class_id = ?", (class_id,)).fetchall()]
+        else:
+            student_ids = [row[0] for row in conn.execute("SELECT id FROM students WHERE section = ?", (section,)).fetchall()]
+    finally:
+        conn.close()
+    if not student_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in student_ids)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with closing(get_local_connection()) as local:
+        rows = local.execute(
+            f"SELECT student_id, encrypted_samples FROM face_enrollments "
+            f"WHERE expires_at > ? AND student_id IN ({placeholders})",
+            (now, *student_ids),
+        ).fetchall()
+    if not rows:
+        return []
+    cipher = _local_face_cipher()
+    return [
+        (student_id, json.loads(cipher.decrypt(encrypted.encode("ascii")).decode("utf-8")))
+        for student_id, encrypted in rows
+    ]
+
+
+def get_student_face_enrollment_status(section: str, faculty_id: int,
+                                       class_id: int | None = None) -> dict[int, str]:
+    """Return active enrollment expiry dates without exposing face samples."""
+    conn = get_connection()
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can view face enrollment status.")
+        if class_id is not None:
+            student_ids = [row[0] for row in conn.execute("SELECT id FROM students WHERE class_id = ?", (class_id,)).fetchall()]
+        else:
+            student_ids = [row[0] for row in conn.execute("SELECT id FROM students WHERE section = ?", (section,)).fetchall()]
+    finally:
+        conn.close()
+    if not student_ids:
+        return {}
+    placeholders = ",".join("?" for _ in student_ids)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with closing(get_local_connection()) as local:
+        rows = local.execute(
+            f"SELECT student_id, expires_at FROM face_enrollments "
+            f"WHERE expires_at > ? AND student_id IN ({placeholders})",
+            (now, *student_ids),
+        ).fetchall()
+    return {student_id: expires_at for student_id, expires_at in rows}
+
+
+def delete_student_face_enrollment(student_id: int, faculty_id: int) -> bool:
+    """Delete the selected student's device-local biometric samples and audit the action."""
+    conn = get_connection()
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can delete face enrollment.")
+    finally:
+        conn.close()
+    with closing(get_local_connection()) as local:
+        cursor = local.execute("DELETE FROM face_enrollments WHERE student_id = ?", (student_id,))
+        local.commit()
+        deleted = cursor.rowcount > 0
+    if deleted:
+        conn = get_connection()
+        try:
+            cursor = conn.cursor()
+            _audit(cursor, faculty_id, "attendance.face_enrollment_deleted", f"student={student_id}")
+            conn.commit()
+        finally:
+            conn.close()
+    return deleted
 
 
 # ============================================================
@@ -353,77 +763,6 @@ def initialize_database():
     """)
 
     # --------------------------------------------------------
-    # DEFAULT FACULTY
-    # --------------------------------------------------------
-
-    cursor.execute("SELECT id FROM users WHERE username = ?", ("faculty",))
-    if cursor.fetchone() is None:
-        cursor.execute(
-            "INSERT INTO users (username, password, role, name) VALUES (?, ?, ?, ?)",
-            ("faculty", hash_password("faculty123"), "faculty", "Dr. Faculty"),
-        )
-
-    # --------------------------------------------------------
-    # DEMO STUDENTS
-    # --------------------------------------------------------
-
-    demo_students = [
-        (
-            "student",
-            "student123",
-            "Arun Kumar",
-            "23CSE001"
-        ),
-        (
-            "student2",
-            "student123",
-            "Bala Kumar",
-            "23CSE002"
-        ),
-        (
-            "student3",
-            "student123",
-            "Dinesh Raj",
-            "23CSE003"
-        ),
-        (
-            "student4",
-            "student123",
-            "Karthik S",
-            "23CSE004"
-        ),
-        (
-            "student5",
-            "student123",
-            "Ravi Kumar",
-            "23CSE005"
-        )
-    ]
-
-    for username, password, name, roll_number in demo_students:
-        cursor.execute("""
-            SELECT id
-            FROM users
-            WHERE username = ?
-        """, (username,))
-
-        user = cursor.fetchone()
-        if user is None:
-            cursor.execute(
-                "INSERT INTO users (username, password, role, name) VALUES (?, ?, ?, ?)",
-                (username, hash_password(password), "student", name),
-            )
-            user_id = cursor.lastrowid
-        else:
-            user_id = user[0]
-
-        cursor.execute("""
-            INSERT OR IGNORE INTO students
-            (user_id, roll_number, name, department, year, section)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (user_id, roll_number, name, "CSE", 3, "C"))
-
-    # --------------------------------------------------------
     # SUBJECTS
     # --------------------------------------------------------
 
@@ -556,9 +895,11 @@ def initialize_database():
             chunk_index INTEGER NOT NULL,
             content TEXT NOT NULL,
             keywords TEXT,
+            page_number INTEGER,
             FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
         )
     """)
+    _ensure_column(cursor, "document_chunks", "page_number", "INTEGER")
 
     # --------------------------------------------------------
     # LAB EXPERIMENTS, SUBMISSIONS & EXAMS
@@ -665,6 +1006,7 @@ def initialize_database():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignments_due_date ON assignments(due_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignment_submissions_assignment_date ON assignment_submissions(assignment_id, submitted_at DESC)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_document ON document_chunks(document_id, chunk_index)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_page ON document_chunks(document_id, page_number)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_announcements_target_date ON announcements(target_group, created_at DESC)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_reminders_owner_due ON reminders(user_id, due_date)")
     cursor.execute("""
@@ -695,27 +1037,6 @@ def initialize_database():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_stored_files_owner ON stored_files(uploaded_by, created_at DESC)")
-
-    # Populate Initial Sample Data for Timetables, Experiments, FAQs, Questions, Announcements
-    cursor.execute("SELECT COUNT(*) FROM timetables")
-    if cursor.fetchone()[0] == 0:
-        sample_timetables = [
-            (1, "Monday", "09:00", "10:00", "Lab 1", 1),
-            (2, "Monday", "10:15", "11:15", "Lab 2", 1),
-            (3, "Tuesday", "11:30", "12:30", "LH 102", 1),
-            (4, "Wednesday", "14:00", "16:00", "Python Lab", 1),
-        ]
-        cursor.executemany("INSERT INTO timetables (subject_id, day_of_week, start_time, end_time, room, faculty_id) VALUES (?, ?, ?, ?, ?, ?)", sample_timetables)
-
-    cursor.execute("SELECT COUNT(*) FROM lab_experiments")
-    if cursor.fetchone()[0] == 0:
-        sample_exps = [
-            (4, 1, "Variables and Data Types", "Write a Python script to calculate area of basic geometric shapes.", "docs/manuals/python_exp1.pdf"),
-            (4, 2, "Functions and Recursion", "Implement recursive fibonacci and factorial in Python.", "docs/manuals/python_exp2.pdf"),
-            (1, 1, "Binary Search Tree Implementation", "Implement insertion, deletion, and traversal in a BST in C/C++.", "docs/manuals/ds_exp1.pdf"),
-            (2, 1, "SQL Queries and Joins", "Execute DDL/DML queries and perform inner, left, and right join operations.", "docs/manuals/dbms_exp1.pdf"),
-        ]
-        cursor.executemany("INSERT INTO lab_experiments (subject_id, exp_number, title, description, manual_path) VALUES (?, ?, ?, ?, ?)", sample_exps)
 
     cursor.execute("SELECT COUNT(*) FROM faq_knowledge_base")
     if cursor.fetchone()[0] == 0:
@@ -805,38 +1126,151 @@ def initialize_database():
             (tutor_seed_version,),
         )
 
-    cursor.execute("SELECT COUNT(*) FROM assignments")
-    if cursor.fetchone()[0] == 0:
-        sample_assignments = [
-            (4, "Python List Comprehensions & Lambdas", "Implement five matrix operations using list comprehensions and lambda functions.", (date.today() + timedelta(days=7)).isoformat()),
-            (2, "ER Diagram & Schema Design", "Design an ER diagram for a Hospital Management System and convert it to 3NF relations.", (date.today() + timedelta(days=14)).isoformat()),
-        ]
-        cursor.executemany("INSERT INTO assignments (subject_id, title, description, due_date) VALUES (?, ?, ?, ?)", sample_assignments)
-
-    cursor.execute("SELECT COUNT(*) FROM announcements")
-    if cursor.fetchone()[0] == 0:
-        sample_announcements = [
-            (1, "Practical Exam Information", "Check the active exam workspace or ask faculty for the confirmed practical examination schedule.", "All"),
-            (1, "Assignment Submission Reminder", "Review each published assignment for its current due date and submission instructions.", "Students")
-        ]
-        cursor.executemany("INSERT INTO announcements (faculty_id, title, content, target_group) VALUES (?, ?, ?, ?)", sample_announcements)
-
-    cursor.execute("SELECT COUNT(*) FROM lab_exams")
-    if cursor.fetchone()[0] == 0:
-        sample_exams = [
-            (4, "Python Practical Exam 1", "Question 1: Write a Python program to parse a CSV file, process student grades, and generate a summary report.\nQuestion 2: Create a GUI using PySide6 to display student records.", 60, 1),
-            (2, "DBMS Practical Exam 1", "Question 1: Write SQL queries to find top 3 students by GPA.\nQuestion 2: Create a stored procedure to update attendance percentage.", 45, 0)
-        ]
-        cursor.executemany("INSERT INTO lab_exams (subject_id, title, question_paper_text, duration_minutes, is_active) VALUES (?, ?, ?, ?, ?)", sample_exams)
-
     # Keep legacy installations with multiple seeded active exams consistent with the single-active-exam workflow.
     cursor.execute("UPDATE lab_exams SET is_active = 0 WHERE is_active = 1 AND id <> (SELECT MAX(id) FROM lab_exams WHERE is_active = 1)")
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lab_exams_single_active ON lab_exams(is_active) WHERE is_active = 1")
 
-    cursor.execute("PRAGMA user_version = 2")
+    from exams.schema import ensure_exam_schema
+    ensure_exam_schema(cursor)
+
+    # Normalized academic structure: students belong to a class, and courses
+    # are assigned to both a class and a faculty member.
+    cursor.execute("""CREATE TABLE IF NOT EXISTS academic_classes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        department TEXT NOT NULL,
+        year_of_study INTEGER NOT NULL,
+        section TEXT NOT NULL,
+        academic_year TEXT NOT NULL,
+        created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(department, year_of_study, section, academic_year),
+        CHECK(year_of_study BETWEEN 1 AND 8)
+    )""")
+    cursor.execute("""CREATE TABLE IF NOT EXISTS faculty_profiles (
+        user_id INTEGER PRIMARY KEY,
+        employee_code TEXT UNIQUE,
+        department TEXT NOT NULL DEFAULT '',
+        designation TEXT NOT NULL DEFAULT 'Faculty',
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    )""")
+    cursor.execute("""CREATE TABLE IF NOT EXISTS teaching_assignments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        class_id INTEGER NOT NULL,
+        subject_id INTEGER NOT NULL,
+        faculty_id INTEGER NOT NULL,
+        academic_term TEXT NOT NULL DEFAULT 'Full Year',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(class_id) REFERENCES academic_classes(id) ON DELETE CASCADE,
+        FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE,
+        FOREIGN KEY(faculty_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE(class_id, subject_id, academic_term)
+    )""")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_teaching_assignments_faculty ON teaching_assignments(faculty_id, class_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_teaching_assignments_class ON teaching_assignments(class_id, subject_id)")
+    _ensure_column(cursor, "students", "class_id", "INTEGER REFERENCES academic_classes(id)")
+    _ensure_column(cursor, "attendance_sessions", "class_id", "INTEGER REFERENCES academic_classes(id)")
+    _ensure_column(cursor, "assignments", "class_id", "INTEGER REFERENCES academic_classes(id)")
+    _ensure_column(cursor, "assignments", "faculty_id", "INTEGER REFERENCES users(id)")
+    _ensure_column(cursor, "notes", "class_id", "INTEGER REFERENCES academic_classes(id)")
+    _ensure_column(cursor, "question_banks", "class_id", "INTEGER REFERENCES academic_classes(id)")
+    _ensure_column(cursor, "documents", "class_id", "INTEGER REFERENCES academic_classes(id)")
+    _ensure_column(cursor, "timetables", "class_id", "INTEGER REFERENCES academic_classes(id)")
+    _ensure_column(cursor, "lab_experiments", "class_id", "INTEGER REFERENCES academic_classes(id)")
+    _ensure_column(cursor, "lab_exams", "class_id", "INTEGER REFERENCES academic_classes(id)")
+    _ensure_column(cursor, "announcements", "class_id", "INTEGER REFERENCES academic_classes(id)")
+    _ensure_column(cursor, "online_exams", "class_id", "INTEGER REFERENCES academic_classes(id)")
+    _ensure_column(cursor, "academic_classes", "created_by", "INTEGER REFERENCES users(id)")
+    _ensure_column(cursor, "assistant_query_events", "user_id", "INTEGER REFERENCES users(id)")
+    _ensure_column(cursor, "assistant_query_events", "class_id", "INTEGER REFERENCES academic_classes(id)")
+
+    _reset_shared_application_data_once(cursor)
+
+    academic_year = current_academic_year()
+    legacy_classes = cursor.execute("""SELECT DISTINCT department, year, section
+        FROM students WHERE class_id IS NULL ORDER BY department, year, section""").fetchall()
+    for department, year, section in legacy_classes:
+        department = str(department or "General").strip() or "General"
+        section = str(section or "A").strip() or "A"
+        cursor.execute("""INSERT OR IGNORE INTO academic_classes
+            (department, year_of_study, section, academic_year) VALUES (?, ?, ?, ?)""",
+            (department, int(year or 1), section, academic_year))
+        class_id = cursor.execute("""SELECT id FROM academic_classes WHERE department = ?
+            AND year_of_study = ? AND section = ? AND academic_year = ?""",
+            (department, int(year or 1), section, academic_year)).fetchone()[0]
+        cursor.execute("""UPDATE students SET class_id = ? WHERE class_id IS NULL
+            AND COALESCE(department, 'General') = ? AND COALESCE(year, 1) = ?
+            AND COALESCE(section, 'A') = ?""",
+            (class_id, department, int(year or 1), section))
+    cursor.execute("""INSERT OR IGNORE INTO faculty_profiles(user_id, department, designation)
+        SELECT id, '', 'Faculty' FROM users WHERE role = 'faculty'""")
+    classes = cursor.execute("SELECT id FROM academic_classes ORDER BY id").fetchall()
+    faculty = cursor.execute("SELECT id FROM users WHERE role = 'faculty' ORDER BY id").fetchall()
+    # Preserve the legacy demo schedule as explicit teaching assignments when
+    # it can be mapped safely to a single existing class.
+    if len(classes) == 1:
+        class_id = classes[0][0]
+        for subject_id, faculty_id in cursor.execute(
+            "SELECT DISTINCT subject_id, faculty_id FROM timetables WHERE faculty_id IS NOT NULL"
+        ).fetchall():
+            if any(int(faculty_id) == int(item[0]) for item in faculty):
+                cursor.execute("""INSERT OR IGNORE INTO teaching_assignments
+                    (class_id, subject_id, faculty_id, academic_term) VALUES (?, ?, ?, 'Full Year')""",
+                    (class_id, subject_id, faculty_id))
+
+    def unique_offering(subject_id, faculty_id=None, section=None):
+        sql = """SELECT DISTINCT c.id FROM teaching_assignments ta
+            JOIN academic_classes c ON c.id = ta.class_id WHERE ta.subject_id = ?"""
+        params = [subject_id]
+        if faculty_id is not None:
+            sql += " AND ta.faculty_id = ?"
+            params.append(faculty_id)
+        if section is not None:
+            sql += " AND c.section = ?"
+            params.append(section)
+        found = cursor.execute(sql, tuple(params)).fetchall()
+        return found[0][0] if len(found) == 1 else None
+
+    for entry_id, subject_id, faculty_id in cursor.execute(
+        "SELECT id, subject_id, faculty_id FROM timetables WHERE class_id IS NULL AND faculty_id IS NOT NULL"
+    ).fetchall():
+        class_id = unique_offering(subject_id, faculty_id)
+        if class_id is not None:
+            cursor.execute("UPDATE timetables SET class_id = ? WHERE id = ?", (class_id, entry_id))
+    for table, key_column, owner_column in (("assignments", "id", "faculty_id"),
+                                             ("notes", "id", "uploaded_by"),
+                                             ("documents", "id", "uploaded_by"),
+                                             ("online_exams", "id", "faculty_id")):
+        rows = cursor.execute(f"SELECT {key_column}, subject_id, {owner_column} FROM {table} WHERE class_id IS NULL").fetchall()
+        for entry_id, subject_id, owner_id in rows:
+            class_id = unique_offering(subject_id, owner_id) if owner_id is not None else unique_offering(subject_id)
+            if class_id is not None:
+                cursor.execute(f"UPDATE {table} SET class_id = ? WHERE {key_column} = ?", (class_id, entry_id))
+    for table, key_column in (("question_banks", "id"), ("lab_experiments", "id"), ("lab_exams", "id")):
+        rows = cursor.execute(f"SELECT {key_column}, subject_id FROM {table} WHERE class_id IS NULL").fetchall()
+        for entry_id, subject_id in rows:
+            class_id = unique_offering(subject_id)
+            if class_id is not None:
+                cursor.execute(f"UPDATE {table} SET class_id = ? WHERE {key_column} = ?", (class_id, entry_id))
+    for entry_id, subject_id, section in cursor.execute(
+        "SELECT id, subject_id, section FROM attendance_sessions WHERE class_id IS NULL"
+    ).fetchall():
+        section = str(section or "").split("~class-", 1)[0]
+        class_id = unique_offering(subject_id, section=section)
+        if class_id is not None:
+            cursor.execute("UPDATE attendance_sessions SET class_id = ? WHERE id = ?", (class_id, entry_id))
+    cursor.execute("""UPDATE assignments SET faculty_id = (
+        SELECT ta.faculty_id FROM teaching_assignments ta WHERE ta.class_id = assignments.class_id
+        AND ta.subject_id = assignments.subject_id LIMIT 1)
+        WHERE faculty_id IS NULL AND class_id IS NOT NULL""")
+
+    _seed_academic_demo_data(cursor)
+
+    cursor.execute("PRAGMA user_version = 4")
     connection.commit()
     connection.close()
     initialize_local_database()
+    _clear_local_demo_data_once("1")
+    purge_face_enrollments()
     from storage.local_storage import storage_service
     storage_service.remove_orphaned_files()
 
@@ -875,7 +1309,9 @@ def authenticate_user(username, password):
 # GET STUDENTS
 # ============================================================
 
-def get_students(section: str | None = None, *, faculty_id: int):
+def get_students(section: str | None = None, *, faculty_id: int, class_id: int | None = None,
+                 year: int | None = None, department: str | None = None,
+                 academic_year: str | None = None):
     connection = get_connection()
     cursor = connection.cursor()
 
@@ -892,13 +1328,21 @@ def get_students(section: str | None = None, *, faculty_id: int):
             name,
             department,
             year,
-            section
+            section,
+            class_id
         FROM students
     """
-    if section:
-        cursor.execute(query + " WHERE section = ? ORDER BY roll_number", (section,))
-    else:
-        cursor.execute(query + " ORDER BY roll_number")
+    conditions, params = ["class_id IN (SELECT class_id FROM teaching_assignments WHERE faculty_id = ? UNION SELECT id FROM academic_classes WHERE created_by = ?)"], [faculty_id, faculty_id]
+    for column, value in (("section", section), ("class_id", class_id), ("year", year),
+                          ("department", department)):
+        if value is not None and value != "":
+            conditions.append(f"{column} = ?")
+            params.append(value)
+    if academic_year:
+        conditions.append("class_id IN (SELECT id FROM academic_classes WHERE academic_year = ?)")
+        params.append(academic_year)
+    cursor.execute(query + (" WHERE " + " AND ".join(conditions) if conditions else "")
+                   + " ORDER BY department, year, section, roll_number", tuple(params))
 
     students = cursor.fetchall()
 
@@ -911,19 +1355,36 @@ def get_students(section: str | None = None, *, faculty_id: int):
 # GET SUBJECTS
 # ============================================================
 
-def get_subjects():
+def get_subjects(*, faculty_id: int | None = None, class_id: int | None = None,
+                 student_user_id: int | None = None):
 
     connection = get_connection()
     cursor = connection.cursor()
 
-    cursor.execute("""
-        SELECT
-            id,
-            code,
-            name
-        FROM subjects
-        ORDER BY code
-    """)
+    if student_user_id is not None:
+        student_class = cursor.execute("SELECT class_id FROM students WHERE user_id = ?", (student_user_id,)).fetchone()
+        class_id = student_class[0] if student_class else None
+        if class_id is None:
+            connection.close()
+            return []
+    if class_id is not None or faculty_id is not None:
+        conditions, params = [], []
+        if class_id is not None:
+            conditions.append("ta.class_id = ?")
+            params.append(class_id)
+        if faculty_id is not None:
+            conditions.append("ta.faculty_id = ?")
+            params.append(faculty_id)
+        cursor.execute("""SELECT DISTINCT s.id, s.code, s.name FROM subjects s
+            JOIN teaching_assignments ta ON ta.subject_id = s.id WHERE """
+            + " AND ".join(conditions) + " ORDER BY s.code", tuple(params))
+        rows = cursor.fetchall()
+        if rows or class_id is not None:
+            connection.close()
+            return rows
+        # Compatibility for a legacy database or a newly created class before
+        # the faculty has allocated its first course.
+    cursor.execute("SELECT id, code, name FROM subjects ORDER BY code")
 
     subjects = cursor.fetchall()
 
@@ -943,124 +1404,119 @@ def save_attendance(
     faculty_id,
     section="C",
     verification_method="manual",
+    class_id: int | None = None,
 ):
+    if not isinstance(records, dict) or not records:
+        raise ValueError("Attendance cannot be saved without student records.")
+    try:
+        date.fromisoformat(str(attendance_date))
+    except (TypeError, ValueError) as error:
+        raise ValueError("Choose a valid attendance date.") from error
+    section = str(section or "").strip()
+    if not section:
+        raise ValueError("Choose a class section.")
 
     connection = get_connection()
-    cursor = connection.cursor()
+    try:
+        cursor = connection.cursor()
+        faculty = cursor.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not faculty or faculty[0] != "faculty":
+            raise PermissionError("Only a faculty account can save attendance.")
+        if not cursor.execute("SELECT 1 FROM subjects WHERE id = ?", (subject_id,)).fetchone():
+            raise ValueError("Choose a valid subject.")
 
-    if not records:
-        raise ValueError("Attendance cannot be saved without student records.")
-    cursor.execute("SELECT role FROM users WHERE id = ?", (faculty_id,))
-    faculty = cursor.fetchone()
-    if not faculty or faculty[0] != "faculty":
-        connection.close()
-        raise PermissionError("Only a faculty account can save attendance.")
-
-    # --------------------------------------------------------
-    # Create or get attendance session
-    # --------------------------------------------------------
-
-    cursor.execute("""
-        INSERT OR IGNORE INTO attendance_sessions
-        (
-            subject_id,
-            faculty_id,
-            class_date,
-            section
-        )
-        VALUES (?, ?, ?, ?)
-    """, (
-        subject_id,
-        faculty_id,
-        attendance_date,
-        section
-    ))
-
-    cursor.execute("""
-        SELECT id
-        FROM attendance_sessions
-        WHERE subject_id = ?
-        AND class_date = ?
-        AND section = ?
-    """, (
-        subject_id,
-        attendance_date,
-        section
-    ))
-
-    session = cursor.fetchone()
-
-    if session is None:
-        connection.close()
-        raise Exception("Unable to create attendance session.")
-
-    session_id = session[0]
-
-    # --------------------------------------------------------
-    # Save every student's attendance
-    # --------------------------------------------------------
-
-    for student_id, value in records.items():
-        if isinstance(value, (tuple, list)):
-            status, method = value
+        if class_id is not None:
+            roster = {row[0] for row in cursor.execute("SELECT id FROM students WHERE class_id = ?", (class_id,)).fetchall()}
+            class_row = cursor.execute("SELECT section FROM academic_classes WHERE id = ?", (class_id,)).fetchone()
+            if not class_row or class_row[0] != section:
+                raise ValueError("The selected class no longer matches the attendance roster.")
+            session_section = f"{section}~class-{class_id}"
+            if not cursor.execute("SELECT 1 FROM teaching_assignments WHERE class_id=? AND subject_id=? AND faculty_id=?",
+                                  (class_id, subject_id, faculty_id)).fetchone():
+                raise PermissionError("This subject is not assigned to you for the selected class.")
         else:
-            status, method = value, verification_method
-        if status not in ("Present", "Absent"):
-            connection.rollback()
-            connection.close()
-            raise ValueError(f"Invalid attendance status for student {student_id}.")
-        if method not in ("manual", "voice", "qr", "face"):
-            connection.rollback()
-            connection.close()
-            raise ValueError(f"Invalid attendance verification method: {method}.")
+            roster = {row[0] for row in cursor.execute("SELECT id FROM students WHERE section = ?", (section,)).fetchall()}
+            session_section = section
+        submitted = {int(student_id) for student_id in records}
+        if not roster:
+            raise ValueError(f"There are no enrolled students in section {section}.")
+        if submitted != roster:
+            raise ValueError("The attendance list has changed. Reload the register and mark every enrolled student.")
+
+        normalized_records = []
+        for student_id, value in records.items():
+            if isinstance(value, (tuple, list)) and len(value) == 2:
+                status, method = value
+            else:
+                status, method = value, verification_method
+            if status not in ("Present", "Absent"):
+                raise ValueError(f"Mark every student Present or Absent before saving (student {student_id}).")
+            if method not in ("manual", "voice", "qr", "face"):
+                raise ValueError(f"Invalid attendance verification method: {method}.")
+            normalized_records.append((int(student_id), status, method))
 
         cursor.execute("""
-            INSERT INTO attendance_records
-            (
-                session_id,
-                student_id,
-                status,
-                verification_method
-            )
-            VALUES (?, ?, ?, ?)
+            INSERT OR IGNORE INTO attendance_sessions
+                (subject_id, faculty_id, class_date, section, class_id)
+            VALUES (?, ?, ?, ?, ?)
+        """, (subject_id, faculty_id, attendance_date, session_section, class_id))
+        session = cursor.execute("""
+            SELECT id FROM attendance_sessions
+            WHERE subject_id = ? AND class_date = ? AND section = ?
+        """, (subject_id, attendance_date, session_section)).fetchone()
+        if session is None:
+            raise RuntimeError("Unable to open the attendance session.")
+        session_id = session[0]
 
-            ON CONFLICT(session_id, student_id)
-            DO UPDATE SET
-                status = excluded.status,
-                verification_method = excluded.verification_method,
-                marked_at = CURRENT_TIMESTAMP
-        """, (
-            session_id,
-            student_id,
-            status,
-            method
-        ))
+        for student_id, status, method in normalized_records:
+            cursor.execute("""
+                INSERT INTO attendance_records
+                    (session_id, student_id, status, verification_method)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id, student_id)
+                DO UPDATE SET status = excluded.status,
+                              verification_method = excluded.verification_method,
+                              marked_at = CURRENT_TIMESTAMP
+            """, (session_id, student_id, status, method))
 
-    _audit(cursor, faculty_id, "attendance.saved", f"session={session_id}; students={len(records)}")
-    connection.commit()
-    connection.close()
+        _audit(cursor, faculty_id, "attendance.saved", f"session={session_id}; students={len(records)}")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
-def get_attendance_session_records(subject_id: int, attendance_date: str, section: str = "C") -> dict:
+def get_attendance_session_records(subject_id: int, attendance_date: str, section: str = "C",
+                                   class_id: int | None = None) -> dict:
     conn = get_connection()
-    rows = conn.execute("""
+    if class_id is not None:
+        rows = conn.execute("""
+        SELECT ar.student_id, ar.status, ar.verification_method
+        FROM attendance_records ar JOIN attendance_sessions s ON s.id = ar.session_id
+        WHERE s.subject_id = ? AND s.class_date = ? AND s.class_id = ?
+        """, (subject_id, attendance_date, class_id)).fetchall()
+    else:
+        rows = conn.execute("""
         SELECT ar.student_id, ar.status, ar.verification_method
         FROM attendance_records ar
         JOIN attendance_sessions s ON s.id = ar.session_id
         WHERE s.subject_id = ? AND s.class_date = ? AND s.section = ?
-    """, (subject_id, attendance_date, section)).fetchall()
+        """, (subject_id, attendance_date, section)).fetchall()
     conn.close()
     return {student_id: (status, method) for student_id, status, method in rows}
 
 
 def mark_student_attendance_from_qr(user_id: int, subject_id: int, attendance_date: str,
-                                   faculty_id: int, section: str) -> None:
+                                   faculty_id: int, section: str,
+                                   class_id: int | None = None) -> None:
     if attendance_date != date.today().isoformat():
         raise ValueError("This attendance code is not for today.")
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT st.id, st.section, u.role
+        SELECT st.id, st.section, u.role, st.class_id
         FROM students st JOIN users u ON u.id = st.user_id
         WHERE st.user_id = ?
     """, (user_id,))
@@ -1072,20 +1528,33 @@ def mark_student_attendance_from_qr(user_id: int, subject_id: int, attendance_da
     if not student or student[2] != "student":
         conn.close()
         raise PermissionError("A student account is required to mark QR attendance.")
-    if student[1] != section:
+    if class_id is not None and student[3] != class_id:
+        conn.close()
+        raise PermissionError("This attendance code is for a different academic class.")
+    if class_id is None and student[1] != section:
         conn.close()
         raise PermissionError("This attendance code is for a different class section.")
     if not faculty or faculty[0] != "faculty" or not subject:
         conn.close()
         raise ValueError("The attendance code refers to an invalid class session.")
+    if class_id is not None:
+        assigned_class = cursor.execute("SELECT section FROM academic_classes WHERE id = ?", (class_id,)).fetchone()
+        teaching = cursor.execute("""SELECT 1 FROM teaching_assignments
+            WHERE class_id = ? AND subject_id = ? AND faculty_id = ?""",
+            (class_id, subject_id, faculty_id)).fetchone()
+        if not assigned_class or not teaching:
+            conn.close()
+            raise PermissionError("The QR code does not match an assigned class subject.")
+        section = assigned_class[0]
+    session_section = f"{section}~class-{class_id}" if class_id is not None else student[1]
     cursor.execute("""
-        INSERT OR IGNORE INTO attendance_sessions (subject_id, faculty_id, class_date, section)
-        VALUES (?, ?, ?, ?)
-    """, (subject_id, faculty_id, attendance_date, student[1]))
+        INSERT OR IGNORE INTO attendance_sessions (subject_id, faculty_id, class_date, section, class_id)
+        VALUES (?, ?, ?, ?, ?)
+    """, (subject_id, faculty_id, attendance_date, session_section, class_id))
     cursor.execute("""
         SELECT id FROM attendance_sessions
         WHERE subject_id = ? AND class_date = ? AND section = ?
-    """, (subject_id, attendance_date, student[1]))
+    """, (subject_id, attendance_date, session_section))
     session = cursor.fetchone()
     if not session:
         conn.close()
@@ -1121,7 +1590,8 @@ def get_student_profile(user_id):
             name,
             department,
             year,
-            section
+            section,
+            class_id
         FROM students
         WHERE user_id = ?
     """, (
@@ -1142,6 +1612,8 @@ def get_student_academic_records(user_id: int):
         FROM students st
         JOIN academics a ON a.student_id = st.id
         JOIN subjects s ON s.id = a.subject_id
+        JOIN (SELECT DISTINCT class_id, subject_id FROM teaching_assignments) ta
+            ON ta.class_id = st.class_id AND ta.subject_id = s.id
         WHERE st.user_id = ?
         ORDER BY s.code
     """, (user_id,)).fetchall()
@@ -1149,20 +1621,180 @@ def get_student_academic_records(user_id: int):
     return rows
 
 
-def get_all_academic_records(faculty_id: int):
+def get_academic_classes(*, faculty_id: int | None = None, student_user_id: int | None = None) -> list[tuple]:
+    conn = get_connection()
+    try:
+        if student_user_id is not None:
+            return conn.execute("""SELECT c.id, c.department, c.year_of_study, c.section,
+                    c.academic_year, COUNT(st.id)
+                FROM academic_classes c JOIN students st ON st.class_id = c.id
+                WHERE st.user_id = ? GROUP BY c.id ORDER BY c.academic_year DESC, c.department, c.year_of_study, c.section""",
+                (student_user_id,)).fetchall()
+        if faculty_id is not None:
+            role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+            if not role or role[0] != "faculty":
+                raise PermissionError("Only faculty can manage academic classes.")
+            return conn.execute("""SELECT c.id, c.department, c.year_of_study, c.section,
+                    c.academic_year, COUNT(st.id)
+                FROM academic_classes c LEFT JOIN students st ON st.class_id = c.id
+                WHERE c.created_by = ? OR EXISTS (SELECT 1 FROM teaching_assignments ta
+                    WHERE ta.class_id = c.id AND ta.faculty_id = ?)
+                GROUP BY c.id ORDER BY c.academic_year DESC, c.department, c.year_of_study, c.section""",
+                (faculty_id, faculty_id)).fetchall()
+        return conn.execute("""SELECT c.id, c.department, c.year_of_study, c.section,
+                c.academic_year, COUNT(st.id)
+            FROM academic_classes c LEFT JOIN students st ON st.class_id = c.id
+            GROUP BY c.id ORDER BY c.academic_year DESC, c.department, c.year_of_study, c.section""").fetchall()
+    finally:
+        conn.close()
+
+
+def get_student_class_id(user_id: int) -> int | None:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT class_id FROM students WHERE user_id = ?", (user_id,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+    finally:
+        conn.close()
+
+
+def create_academic_class(faculty_id: int, department: str, year: int, section: str,
+                          academic_year: str) -> int:
+    department, section, academic_year = (str(value or "").strip()
+                                          for value in (department, section, academic_year))
+    try:
+        year = int(year)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Choose a valid year of study.") from error
+    if not department or not section or not academic_year:
+        raise ValueError("Department, academic year, and class section are required.")
+    if not 1 <= year <= 8:
+        raise ValueError("Year of study must be between 1 and 8.")
+    if len(academic_year) != 9 or academic_year[4] != "-" or not academic_year[:4].isdigit() or not academic_year[5:].isdigit():
+        raise ValueError("Academic year must use YYYY-YYYY format, such as 2026-2027.")
+    if int(academic_year[5:]) != int(academic_year[:4]) + 1:
+        raise ValueError("The end year must be one year after the start year.")
+    conn = get_connection()
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can create an academic class.")
+        class_id = _get_or_create_academic_class(conn.cursor(), department, year, section, academic_year)
+        conn.execute("UPDATE academic_classes SET created_by = COALESCE(created_by, ?) WHERE id = ?",
+                     (faculty_id, class_id))
+        _audit(conn.cursor(), faculty_id, "academic_class.created",
+               f"class={class_id}; dept={department}; year={year}; section={section}; academic_year={academic_year}")
+        conn.commit()
+        return class_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_faculty_directory(actor_id: int) -> list[tuple]:
+    conn = get_connection()
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (actor_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can view teaching staff.")
+        return conn.execute("""SELECT u.id, u.name, fp.employee_code, fp.department, fp.designation
+            FROM users u LEFT JOIN faculty_profiles fp ON fp.user_id = u.id
+            WHERE u.role = 'faculty' ORDER BY u.name""").fetchall()
+    finally:
+        conn.close()
+
+
+def update_faculty_profile(faculty_id: int, employee_code: str, department: str,
+                           designation: str) -> None:
+    employee_code, department, designation = (str(value or "").strip()
+                                               for value in (employee_code, department, designation))
+    conn = get_connection()
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can update a faculty profile.")
+        conn.execute("""INSERT INTO faculty_profiles(user_id, employee_code, department, designation)
+            VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET employee_code=excluded.employee_code,
+            department=excluded.department, designation=excluded.designation""",
+            (faculty_id, employee_code or None, department, designation or "Faculty"))
+        _audit(conn.cursor(), faculty_id, "faculty_profile.updated", f"department={department}; designation={designation}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def assign_subject_to_class(actor_id: int, class_id: int, subject_id: int,
+                            faculty_id: int, academic_term: str = "Full Year") -> int:
+    term = str(academic_term or "").strip() or "Full Year"
+    conn = get_connection()
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (actor_id,)).fetchone()
+        target = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty" or not target or target[0] != "faculty":
+            raise PermissionError("Only faculty accounts can manage teaching assignments.")
+        if not conn.execute("SELECT 1 FROM academic_classes WHERE id = ?", (class_id,)).fetchone():
+            raise ValueError("Choose a valid academic class.")
+        if not conn.execute("SELECT 1 FROM subjects WHERE id = ?", (subject_id,)).fetchone():
+            raise ValueError("Choose a valid subject.")
+        conn.execute("""INSERT INTO teaching_assignments(class_id, subject_id, faculty_id, academic_term)
+            VALUES (?, ?, ?, ?) ON CONFLICT(class_id, subject_id, academic_term)
+            DO UPDATE SET faculty_id=excluded.faculty_id""",
+            (class_id, subject_id, faculty_id, term))
+        row = conn.execute("""SELECT id FROM teaching_assignments
+            WHERE class_id=? AND subject_id=? AND academic_term=?""", (class_id, subject_id, term)).fetchone()
+        _audit(conn.cursor(), actor_id, "teaching_assignment.saved",
+               f"assignment={row[0]}; class={class_id}; subject={subject_id}; faculty={faculty_id}")
+        conn.commit()
+        return int(row[0])
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_class_subjects(class_id: int, *, faculty_id: int | None = None) -> list[tuple]:
+    conn = get_connection()
+    try:
+        sql = """SELECT s.id, s.code, s.name, ta.faculty_id, u.name, ta.academic_term
+            FROM teaching_assignments ta JOIN subjects s ON s.id=ta.subject_id
+            JOIN users u ON u.id=ta.faculty_id WHERE ta.class_id=?"""
+        params: tuple = (class_id,)
+        if faculty_id is not None:
+            sql += " AND ta.faculty_id=?"
+            params = (class_id, faculty_id)
+        return conn.execute(sql + " ORDER BY s.code", params).fetchall()
+    finally:
+        conn.close()
+
+
+def get_all_academic_records(faculty_id: int, class_id: int | None = None):
     conn = get_connection()
     try:
         role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
         if not role or role[0] != "faculty":
             raise PermissionError("Only faculty can view all academic records.")
-        return conn.execute("""
+        query = """
             SELECT st.id, st.roll_number, st.name, s.id, s.code, s.name,
-                   a.internal_mark, a.assignment_mark, a.lab_mark, a.total_mark
+                   a.internal_mark, a.assignment_mark, a.lab_mark, a.total_mark,
+                   st.class_id, c.department, c.year_of_study, c.section, c.academic_year
             FROM students st
-            CROSS JOIN subjects s
+        JOIN (SELECT DISTINCT class_id, subject_id, faculty_id FROM teaching_assignments) ta
+            ON ta.class_id = st.class_id AND ta.faculty_id = ?
+            JOIN subjects s ON s.id = ta.subject_id
+            LEFT JOIN academic_classes c ON c.id = st.class_id
             LEFT JOIN academics a ON a.student_id = st.id AND a.subject_id = s.id
-            ORDER BY st.roll_number, s.code
-        """).fetchall()
+        """
+        params: tuple = (faculty_id,)
+        if class_id is not None:
+            query += " WHERE st.class_id = ?"
+            params = (faculty_id, class_id)
+        return conn.execute(query + " ORDER BY c.year_of_study, c.section, st.roll_number, s.code", params).fetchall()
     finally:
         conn.close()
 
@@ -1179,6 +1811,13 @@ def save_academic_record(student_id: int, subject_id: int, internal_mark: float,
     if not role or role[0] != "faculty":
         conn.close()
         raise PermissionError("Only faculty can update academic records.")
+    assigned = cursor.execute("""SELECT 1 FROM students st
+        JOIN (SELECT DISTINCT class_id, subject_id, faculty_id FROM teaching_assignments) ta ON ta.class_id = st.class_id
+        WHERE st.id = ? AND ta.subject_id = ? AND ta.faculty_id = ?""",
+        (student_id, subject_id, faculty_id)).fetchone()
+    if not assigned:
+        conn.close()
+        raise PermissionError("This subject is not assigned to you for the student's class.")
     total = round(sum(marks), 2)
     cursor.execute("""
         INSERT INTO academics (student_id, subject_id, internal_mark, assignment_mark, lab_mark, total_mark)
@@ -1208,7 +1847,7 @@ def get_student_attendance(user_id):
             s.code,
             s.name,
 
-            COUNT(ar.id) AS total_classes,
+            COUNT(DISTINCT ats.id) AS total_classes,
 
             COALESCE(
                 SUM(
@@ -1223,15 +1862,15 @@ def get_student_attendance(user_id):
 
         FROM students st
 
-        CROSS JOIN subjects s
+        JOIN (SELECT DISTINCT class_id, subject_id FROM teaching_assignments) ta ON ta.class_id = st.class_id
+        JOIN subjects s ON s.id = ta.subject_id
 
         LEFT JOIN attendance_sessions ats
             ON ats.subject_id = s.id
-            AND ats.section = st.section
+            AND (ats.class_id = st.class_id OR (ats.class_id IS NULL AND ats.section = st.section))
 
         LEFT JOIN attendance_records ar
-            ON ar.session_id = ats.id
-            AND ar.student_id = st.id
+            ON ar.session_id = ats.id AND ar.student_id = st.id
 
         WHERE st.user_id = ?
 
@@ -1266,15 +1905,16 @@ def get_student_attendance_history(user_id):
             ats.class_date,
             s.code,
             s.name,
-            ar.status
+            COALESCE(ar.status, 'Absent') AS status,
+            COALESCE(ar.verification_method, 'not recorded') AS verification_method
 
         FROM students st
 
-        INNER JOIN attendance_records ar
-            ON ar.student_id = st.id
-
         INNER JOIN attendance_sessions ats
-            ON ats.id = ar.session_id
+            ON ats.class_id = st.class_id OR (ats.class_id IS NULL AND ats.section = st.section)
+
+        LEFT JOIN attendance_records ar
+            ON ar.session_id = ats.id AND ar.student_id = st.id
 
         INNER JOIN subjects s
             ON s.id = ats.subject_id
@@ -1299,18 +1939,33 @@ def get_student_attendance_history(user_id):
 # NEW FEATURE HELPER FUNCTIONS
 # ============================================================
 
-def get_timetables():
+def get_timetables(*, faculty_id: int | None = None, student_user_id: int | None = None,
+                   class_id: int | None = None):
     conn = get_connection()
-    c = conn.cursor()
-    c.execute("""
-        SELECT t.id, s.code, s.name, t.day_of_week, t.start_time, t.end_time, t.room, t.faculty_id
+    try:
+        if student_user_id is not None:
+            student = conn.execute("SELECT class_id FROM students WHERE user_id = ?", (student_user_id,)).fetchone()
+            if not student:
+                raise PermissionError("A student account is required to view a timetable.")
+            class_id = student[0]
+        sql = """SELECT t.id, s.code, s.name, t.day_of_week, t.start_time, t.end_time,
+                t.room, t.faculty_id, t.class_id, c.department, c.year_of_study, c.section, c.academic_year
         FROM timetables t
         JOIN subjects s ON s.id = t.subject_id
-        ORDER BY t.day_of_week, t.start_time
-    """)
-    rows = c.fetchall()
-    conn.close()
-    return rows
+        LEFT JOIN academic_classes c ON c.id = t.class_id"""
+        conditions, params = [], []
+        if faculty_id is not None:
+            conditions.append("t.faculty_id = ?")
+            params.append(faculty_id)
+        if student_user_id is not None or class_id is not None:
+            conditions.append("(t.class_id = ? OR (t.class_id IS NULL AND ? IS NOT NULL))")
+            params.append(class_id)
+            params.append(class_id)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        return conn.execute(sql + " ORDER BY t.day_of_week, t.start_time", tuple(params)).fetchall()
+    finally:
+        conn.close()
 
 
 def _validate_timetable_values(day_of_week: str, start_time: str, end_time: str, room: str) -> None:
@@ -1329,7 +1984,7 @@ def _validate_timetable_values(day_of_week: str, start_time: str, end_time: str,
 
 
 def add_timetable_entry(subject_id: int, day_of_week: str, start_time: str, end_time: str,
-                        room: str, faculty_id: int) -> int:
+                        room: str, faculty_id: int, class_id: int | None = None) -> int:
     _validate_timetable_values(day_of_week, start_time, end_time, room)
     conn = get_connection()
     c = conn.cursor()
@@ -1339,15 +1994,18 @@ def add_timetable_entry(subject_id: int, day_of_week: str, start_time: str, end_
             raise PermissionError("Only faculty can manage the timetable.")
         if not c.execute("SELECT 1 FROM subjects WHERE id = ?", (subject_id,)).fetchone():
             raise ValueError("Choose a valid subject.")
+        if class_id is None or not c.execute("""SELECT 1 FROM teaching_assignments
+            WHERE class_id=? AND subject_id=? AND faculty_id=?""", (class_id, subject_id, faculty_id)).fetchone():
+            raise PermissionError("Choose a class and subject assigned to your faculty account.")
         overlap = c.execute("""SELECT 1 FROM timetables
             WHERE day_of_week = ? AND start_time < ? AND end_time > ?
               AND (faculty_id = ? OR room = ? COLLATE NOCASE) LIMIT 1""",
             (day_of_week, end_time, start_time, faculty_id, room.strip())).fetchone()
         if overlap:
             raise ValueError("This time conflicts with another class for the faculty member or room.")
-        c.execute("""INSERT INTO timetables (subject_id, day_of_week, start_time, end_time, room, faculty_id)
-            VALUES (?, ?, ?, ?, ?, ?)""",
-            (subject_id, day_of_week, start_time, end_time, room.strip(), faculty_id))
+        c.execute("""INSERT INTO timetables (subject_id, day_of_week, start_time, end_time, room, faculty_id, class_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (subject_id, day_of_week, start_time, end_time, room.strip(), faculty_id, class_id))
         entry_id = c.lastrowid
         _audit(c, faculty_id, "timetable.created", f"entry={entry_id}; day={day_of_week}; room={room.strip()}")
         conn.commit()
@@ -1360,7 +2018,7 @@ def add_timetable_entry(subject_id: int, day_of_week: str, start_time: str, end_
 
 
 def update_timetable_entry(entry_id: int, subject_id: int, day_of_week: str, start_time: str,
-                           end_time: str, room: str, faculty_id: int) -> None:
+                           end_time: str, room: str, faculty_id: int, class_id: int | None = None) -> None:
     _validate_timetable_values(day_of_week, start_time, end_time, room)
     conn = get_connection()
     c = conn.cursor()
@@ -1371,6 +2029,9 @@ def update_timetable_entry(entry_id: int, subject_id: int, day_of_week: str, sta
             raise PermissionError("You can update only your own timetable entries.")
         if not c.execute("SELECT 1 FROM subjects WHERE id = ?", (subject_id,)).fetchone():
             raise ValueError("Choose a valid subject.")
+        if class_id is None or not c.execute("""SELECT 1 FROM teaching_assignments
+            WHERE class_id=? AND subject_id=? AND faculty_id=?""", (class_id, subject_id, faculty_id)).fetchone():
+            raise PermissionError("Choose a class and subject assigned to your faculty account.")
         overlap = c.execute("""SELECT 1 FROM timetables
             WHERE id <> ? AND day_of_week = ? AND start_time < ? AND end_time > ?
               AND (faculty_id = ? OR room = ? COLLATE NOCASE) LIMIT 1""",
@@ -1378,8 +2039,8 @@ def update_timetable_entry(entry_id: int, subject_id: int, day_of_week: str, sta
         if overlap:
             raise ValueError("This time conflicts with another class for the faculty member or room.")
         c.execute("""UPDATE timetables SET subject_id = ?, day_of_week = ?, start_time = ?,
-            end_time = ?, room = ? WHERE id = ?""",
-            (subject_id, day_of_week, start_time, end_time, room.strip(), entry_id))
+            end_time = ?, room = ?, class_id = ? WHERE id = ?""",
+            (subject_id, day_of_week, start_time, end_time, room.strip(), class_id, entry_id))
         _audit(c, faculty_id, "timetable.updated", f"entry={entry_id}; day={day_of_week}; room={room.strip()}")
         conn.commit()
     except Exception:
@@ -1407,21 +2068,39 @@ def delete_timetable_entry(entry_id: int, faculty_id: int) -> None:
         conn.close()
 
 
-def get_assignments():
+def get_assignments(*, faculty_id: int | None = None, student_user_id: int | None = None,
+                    class_id: int | None = None):
     conn = get_connection()
-    c = conn.cursor()
-    c.execute("""
-        SELECT a.id, s.code, s.name, a.title, a.description, a.due_date, a.max_marks
+    try:
+        if student_user_id is not None:
+            student = conn.execute("SELECT class_id FROM students WHERE user_id = ?", (student_user_id,)).fetchone()
+            if not student:
+                raise PermissionError("A student account is required to view assignments.")
+            class_id = student[0]
+        sql = """SELECT a.id, s.code, s.name, a.title, a.description, a.due_date, a.max_marks,
+                a.class_id, c.department, c.year_of_study, c.section, c.academic_year
         FROM assignments a
         JOIN subjects s ON s.id = a.subject_id
-        ORDER BY a.due_date
-    """)
-    rows = c.fetchall()
-    conn.close()
-    return rows
+        LEFT JOIN academic_classes c ON c.id = a.class_id
+        """
+        conditions, params = [], []
+        if faculty_id is not None:
+            conditions.append("(a.faculty_id = ? OR a.class_id IN (SELECT class_id FROM teaching_assignments WHERE faculty_id = ?))")
+            params.extend((faculty_id, faculty_id))
+        if student_user_id is not None:
+            conditions.append("(a.class_id IS NULL OR a.class_id = ?)")
+            params.append(class_id)
+        elif class_id is not None:
+            conditions.append("(a.class_id IS NULL OR a.class_id = ?)")
+            params.append(class_id)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        return conn.execute(sql + " ORDER BY a.due_date", tuple(params)).fetchall()
+    finally:
+        conn.close()
 
 
-def add_assignment(subject_id, title, description, due_date, faculty_id=None):
+def add_assignment(subject_id, title, description, due_date, faculty_id=None, class_id=None):
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT role FROM users WHERE id = ?", (faculty_id,))
@@ -1429,28 +2108,55 @@ def add_assignment(subject_id, title, description, due_date, faculty_id=None):
     if not role or role[0] != "faculty":
         conn.close()
         raise PermissionError("Only faculty can publish assignments.")
-    c.execute("INSERT INTO assignments (subject_id, title, description, due_date) VALUES (?, ?, ?, ?)",
-              (subject_id, title, description, due_date))
+    if class_id is None:
+        choices = c.execute("SELECT class_id FROM teaching_assignments WHERE subject_id=? AND faculty_id=?",
+                            (subject_id, faculty_id)).fetchall()
+        if len(choices) == 1:
+            class_id = choices[0][0]
+    if class_id is None:
+        conn.close()
+        raise ValueError("Choose the class this assignment is for.")
+    if not c.execute("SELECT 1 FROM teaching_assignments WHERE class_id=? AND subject_id=? AND faculty_id=?",
+                     (class_id, subject_id, faculty_id)).fetchone():
+        conn.close()
+        raise PermissionError("This subject is not assigned to you for the selected class.")
+    c.execute("""INSERT INTO assignments (subject_id, title, description, due_date, faculty_id, class_id)
+        VALUES (?, ?, ?, ?, ?, ?)""", (subject_id, title, description, due_date, faculty_id, class_id))
     _audit(c, faculty_id, "assignment.created", f"assignment={c.lastrowid}; title={title}")
     conn.commit()
     conn.close()
 
 
-def get_notes():
+def get_notes(*, student_user_id: int | None = None, class_id: int | None = None,
+              faculty_id: int | None = None):
     conn = get_connection()
-    c = conn.cursor()
-    c.execute("""
-        SELECT n.id, s.code, s.name, n.unit_number, n.title, n.file_path, n.created_at
-        FROM notes n
-        JOIN subjects s ON s.id = n.subject_id
-        ORDER BY s.code, n.unit_number
-    """)
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    try:
+        if student_user_id is not None:
+            student = conn.execute("SELECT class_id FROM students WHERE user_id = ?", (student_user_id,)).fetchone()
+            if not student:
+                raise PermissionError("A student account is required to view course notes.")
+            class_id = student[0]
+        sql = """SELECT n.id, s.code, s.name, n.unit_number, n.title, n.file_path, n.created_at,
+                n.class_id, n.uploaded_by
+            FROM notes n JOIN subjects s ON s.id = n.subject_id"""
+        conditions, params = [], []
+        if student_user_id is not None:
+            conditions.append("(n.class_id IS NULL OR n.class_id = ?)")
+            params.append(class_id)
+        elif class_id is not None:
+            conditions.append("(n.class_id IS NULL OR n.class_id = ?)")
+            params.append(class_id)
+        if faculty_id is not None:
+            conditions.append("(n.uploaded_by = ? OR n.uploaded_by IS NULL)")
+            params.append(faculty_id)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        return conn.execute(sql + " ORDER BY s.code, n.unit_number", tuple(params)).fetchall()
+    finally:
+        conn.close()
 
 
-def add_note(subject_id, title, file_path, unit_number=1, uploaded_by=None):
+def add_note(subject_id, title, file_path, unit_number=1, uploaded_by=None, class_id=None):
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT role FROM users WHERE id = ?", (uploaded_by,))
@@ -1458,40 +2164,212 @@ def add_note(subject_id, title, file_path, unit_number=1, uploaded_by=None):
     if not role or role[0] != "faculty":
         conn.close()
         raise PermissionError("Only faculty can upload course notes.")
-    c.execute("INSERT INTO notes (subject_id, title, file_path, unit_number, uploaded_by) VALUES (?, ?, ?, ?, ?)",
-              (subject_id, title, file_path, unit_number, uploaded_by))
+    if class_id is None:
+        choices = c.execute("SELECT class_id FROM teaching_assignments WHERE subject_id=? AND faculty_id=?",
+                            (subject_id, uploaded_by)).fetchall()
+        if len(choices) == 1:
+            class_id = choices[0][0]
+    if class_id is None or not c.execute("""SELECT 1 FROM teaching_assignments
+        WHERE class_id=? AND subject_id=? AND faculty_id=?""", (class_id, subject_id, uploaded_by)).fetchone():
+        conn.close()
+        raise PermissionError("Choose a class and subject assigned to your faculty account.")
+    c.execute("""INSERT INTO notes (subject_id, title, file_path, unit_number, uploaded_by, class_id)
+        VALUES (?, ?, ?, ?, ?, ?)""", (subject_id, title, file_path, unit_number, uploaded_by, class_id))
     _audit(c, uploaded_by, "note.uploaded", f"title={title}")
     conn.commit()
     conn.close()
 
 
-def get_question_banks():
+def delete_course_document(note_id: int, faculty_id: int) -> None:
+    """Delete a course note and its search index; remove its upload if unused."""
+    from storage.local_storage import STORAGE_PREFIX, storage_service
+
     conn = get_connection()
-    c = conn.cursor()
-    c.execute("""
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can delete course documents.")
+        note = conn.execute("SELECT title, file_path FROM notes WHERE id = ?", (note_id,)).fetchone()
+        if not note:
+            raise ValueError("This course document no longer exists.")
+        title, file_path = note
+        conn.execute("DELETE FROM documents WHERE file_path = ? AND title = ?", (file_path, title))
+        conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+        referenced = conn.execute(
+            "SELECT 1 FROM notes WHERE file_path = ? UNION ALL "
+            "SELECT 1 FROM documents WHERE file_path = ? LIMIT 1",
+            (file_path, file_path),
+        ).fetchone()
+        _audit(conn.cursor(), faculty_id, "course_document.deleted", f"note={note_id}; title={title}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    if file_path.startswith(STORAGE_PREFIX) and not referenced:
+        storage_service.remove(file_path)
+
+
+def get_question_banks(*, student_user_id: int | None = None, faculty_id: int | None = None,
+                       class_id: int | None = None):
+    conn = get_connection()
+    try:
+        if student_user_id is not None:
+            student = conn.execute("SELECT class_id FROM students WHERE user_id = ?", (student_user_id,)).fetchone()
+            if not student:
+                raise PermissionError("A student account is required to view the question bank.")
+            class_id = student[0]
+        sql = """
         SELECT q.id, s.code, s.name, q.unit_number, q.question, q.answer_key,
-               q.difficulty, q.marks, q.source_kind, q.exam_year
+               q.difficulty, q.marks, q.source_kind, q.exam_year, q.class_id
         FROM question_banks q
         JOIN subjects s ON s.id = q.subject_id
-        ORDER BY s.code, q.unit_number
-    """)
-    rows = c.fetchall()
-    conn.close()
-    return rows
+        """
+        conditions, params = [], []
+        if student_user_id is not None or class_id is not None:
+            conditions.append("(q.class_id IS NULL OR q.class_id = ?)")
+            params.append(class_id)
+        if faculty_id is not None:
+            conditions.append("(q.class_id IS NULL OR q.class_id IN (SELECT class_id FROM teaching_assignments WHERE faculty_id = ?))")
+            params.append(faculty_id)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        return conn.execute(sql + " ORDER BY s.code, q.unit_number", tuple(params)).fetchall()
+    finally:
+        conn.close()
 
 
-def get_lab_experiments():
+def get_lab_experiments(*, faculty_id: int | None = None, student_user_id: int | None = None,
+                        class_id: int | None = None) -> list[tuple]:
+    """List lab manuals visible to one assigned faculty member or enrolled student."""
     conn = get_connection()
-    c = conn.cursor()
-    c.execute("""
-        SELECT e.id, s.code, s.name, e.exp_number, e.title, e.description, e.manual_path
-        FROM lab_experiments e
-        JOIN subjects s ON s.id = e.subject_id
-        ORDER BY s.code, e.exp_number
-    """)
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    try:
+        conditions, params = [], []
+        if faculty_id is not None:
+            role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+            if not role or role[0] != "faculty":
+                raise PermissionError("Only faculty can manage lab manuals.")
+            conditions.append("(e.class_id IS NULL OR e.class_id IN "
+                              "(SELECT class_id FROM teaching_assignments WHERE faculty_id = ?))")
+            params.append(faculty_id)
+        if student_user_id is not None:
+            student = conn.execute("SELECT role FROM users WHERE id = ?", (student_user_id,)).fetchone()
+            if not student or student[0] != "student":
+                raise PermissionError("A student account is required to view lab manuals.")
+            conditions.append("(e.class_id IS NULL OR e.class_id = "
+                              "(SELECT class_id FROM students WHERE user_id = ?))")
+            params.append(student_user_id)
+        if class_id is not None:
+            conditions.append("e.class_id = ?")
+            params.append(class_id)
+        query = """SELECT e.id, s.code, s.name, e.exp_number, e.title, e.description,
+                e.manual_path, e.class_id, c.department, c.year_of_study, c.section,
+                c.academic_year
+            FROM lab_experiments e JOIN subjects s ON s.id = e.subject_id
+            LEFT JOIN academic_classes c ON c.id = e.class_id"""
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        return conn.execute(query + " ORDER BY s.code, e.exp_number, e.id", tuple(params)).fetchall()
+    finally:
+        conn.close()
+
+
+def create_lab_experiment(faculty_id: int, class_id: int, subject_id: int,
+                          exp_number: int, title: str, description: str,
+                          manual_file: str | None = None) -> int:
+    """Create an assigned, class-scoped lab and optionally store its reference manual."""
+    title = str(title or "").strip()
+    description = str(description or "").strip()
+    try:
+        exp_number = int(exp_number)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Enter a valid experiment number.") from error
+    if not title or len(title) > 200:
+        raise ValueError("Enter an experiment title of 1 to 200 characters.")
+    if not description:
+        raise ValueError("Add experiment instructions before publishing.")
+    if not 1 <= exp_number <= 1000:
+        raise ValueError("Experiment number must be between 1 and 1000.")
+
+    conn = get_connection()
+    stored_manual = None
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can publish lab experiments.")
+        assigned = conn.execute("""SELECT 1 FROM teaching_assignments
+            WHERE class_id = ? AND subject_id = ? AND faculty_id = ?""",
+            (class_id, subject_id, faculty_id)).fetchone()
+        if not assigned:
+            raise PermissionError("Choose a class and subject assigned to your faculty account.")
+        duplicate = conn.execute("""SELECT 1 FROM lab_experiments
+            WHERE class_id = ? AND subject_id = ? AND exp_number = ?""",
+            (class_id, subject_id, exp_number)).fetchone()
+        if duplicate:
+            raise ValueError("That experiment number already exists for this class and subject.")
+        if manual_file:
+            from storage.local_storage import storage_service
+            stored_manual = storage_service.store_file(
+                manual_file, uploaded_by=faculty_id, category="lab_manuals",
+                allowed_extensions={".pdf", ".txt", ".md"},
+            )
+        cursor = conn.cursor()
+        cursor.execute("""INSERT INTO lab_experiments
+            (subject_id, exp_number, title, description, manual_path, class_id)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (subject_id, exp_number, title, description, stored_manual, class_id))
+        experiment_id = cursor.lastrowid
+        _audit(cursor, faculty_id, "lab_experiment.published",
+               f"experiment={experiment_id}; class={class_id}; subject={subject_id}")
+        conn.commit()
+        return int(experiment_id)
+    except Exception:
+        conn.rollback()
+        if stored_manual:
+            from storage.local_storage import storage_service
+            storage_service.remove(stored_manual)
+        raise
+    finally:
+        conn.close()
+
+
+def get_lab_experiment_progress(experiment_id: int, faculty_id: int) -> list[tuple]:
+    """Show every enrolled student's progress for a lab assigned to this faculty member."""
+    conn = get_connection()
+    try:
+        role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
+        if not role or role[0] != "faculty":
+            raise PermissionError("Only faculty can view lab experiment progress.")
+        experiment = conn.execute("SELECT class_id, subject_id FROM lab_experiments WHERE id = ?",
+                                  (experiment_id,)).fetchone()
+        if not experiment:
+            raise ValueError("This lab experiment no longer exists.")
+        class_id, subject_id = experiment
+        assignment_query = "SELECT 1 FROM teaching_assignments WHERE subject_id = ? AND faculty_id = ?"
+        assignment_params = [subject_id, faculty_id]
+        if class_id is not None:
+            assignment_query += " AND class_id = ?"
+            assignment_params.append(class_id)
+        assignment = conn.execute(assignment_query, tuple(assignment_params)).fetchone()
+        if not assignment:
+            raise PermissionError("This lab is not assigned to your faculty account.")
+        if class_id is None:
+            return conn.execute("""SELECT st.id, st.roll_number, st.name,
+                    COALESCE(sub.status, 'Not started'), sub.code_snippet, sub.completed_at, sub.id
+                FROM students st JOIN teaching_assignments ta
+                    ON ta.class_id = st.class_id AND ta.subject_id = ? AND ta.faculty_id = ?
+                LEFT JOIN lab_submissions sub ON sub.experiment_id = ? AND sub.student_id = st.id
+                ORDER BY st.roll_number""", (subject_id, faculty_id, experiment_id)).fetchall()
+        return conn.execute("""SELECT st.id, st.roll_number, st.name,
+                COALESCE(sub.status, 'Not started'), sub.code_snippet, sub.completed_at, sub.id
+            FROM students st LEFT JOIN lab_submissions sub
+                ON sub.experiment_id = ? AND sub.student_id = st.id
+            WHERE st.class_id = ? ORDER BY st.roll_number""",
+            (experiment_id, class_id)).fetchall()
+    finally:
+        conn.close()
 
 
 def get_lab_exams():
@@ -1510,24 +2388,42 @@ def get_lab_exams():
     return rows
 
 
-def get_announcements(role: str | None = None):
+def get_announcements(role: str | None = None, *, user_id: int | None = None,
+                     class_id: int | None = None):
     conn = get_connection()
-    c = conn.cursor()
     query = """
-        SELECT a.id, u.name, a.title, a.content, a.target_group, a.created_at
+        SELECT a.id, u.name, a.title, a.content, a.target_group, a.created_at,
+               a.class_id, c.department, c.year_of_study, c.section, c.academic_year
         FROM announcements a
         JOIN users u ON u.id = a.faculty_id
+        LEFT JOIN academic_classes c ON c.id = a.class_id
     """
+    conditions, params = [], []
     if role == "student":
-        query += " WHERE a.target_group IN ('All', 'Students')"
-    query += " ORDER BY a.created_at DESC"
-    c.execute(query)
-    rows = c.fetchall()
-    conn.close()
-    return rows
+        conditions.append("a.target_group IN ('All', 'Students')")
+        if user_id is not None:
+            student = conn.execute("SELECT class_id FROM students WHERE user_id = ?", (user_id,)).fetchone()
+            class_id = student[0] if student else None
+        if class_id is not None:
+            conditions.append("(a.class_id IS NULL OR a.class_id = ?)")
+            params.append(class_id)
+        else:
+            conditions.append("a.class_id IS NULL")
+    elif role == "faculty" and user_id is not None:
+        conditions.append("(a.faculty_id = ? OR a.class_id IN (SELECT class_id FROM teaching_assignments WHERE faculty_id = ?))")
+        params.extend((user_id, user_id))
+    if class_id is not None and role != "student":
+        conditions.append("(a.class_id IS NULL OR a.class_id = ?)")
+        params.append(class_id)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    try:
+        return conn.execute(query + " ORDER BY a.created_at DESC", tuple(params)).fetchall()
+    finally:
+        conn.close()
 
 
-def add_announcement(faculty_id, title, content, target_group="All"):
+def add_announcement(faculty_id, title, content, target_group="All", class_id: int | None = None):
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT role FROM users WHERE id = ?", (faculty_id,))
@@ -1535,9 +2431,17 @@ def add_announcement(faculty_id, title, content, target_group="All"):
     if not role or role[0] != "faculty":
         conn.close()
         raise PermissionError("Only faculty can publish announcements.")
-    c.execute("INSERT INTO announcements (faculty_id, title, content, target_group) VALUES (?, ?, ?, ?)",
-              (faculty_id, title, content, target_group))
-    _audit(c, faculty_id, "announcement.created", f"title={title}; audience={target_group}")
+    if class_id is not None and not c.execute("SELECT 1 FROM academic_classes WHERE id = ?", (class_id,)).fetchone():
+        conn.close()
+        raise ValueError("Choose a valid academic class.")
+    if class_id is not None and not c.execute("""SELECT 1 FROM academic_classes c
+        WHERE c.id=? AND (c.created_by=? OR EXISTS (SELECT 1 FROM teaching_assignments ta
+        WHERE ta.class_id=c.id AND ta.faculty_id=?))""", (class_id, faculty_id, faculty_id)).fetchone():
+        conn.close()
+        raise PermissionError("Post notices only to a class you created or teach.")
+    c.execute("INSERT INTO announcements (faculty_id, title, content, target_group, class_id) VALUES (?, ?, ?, ?, ?)",
+              (faculty_id, title, content, target_group, class_id))
+    _audit(c, faculty_id, "announcement.created", f"title={title}; audience={target_group}; class={class_id}")
     conn.commit()
     conn.close()
 
@@ -1581,7 +2485,8 @@ def search_faq(query):
 
 
 def get_attendance_analytics(start_date: str | None = None, end_date: str | None = None,
-                             subject_id: int | None = None, section: str | None = None):
+                             subject_id: int | None = None, section: str | None = None,
+                             class_id: int | None = None, faculty_id: int | None = None):
     if start_date:
         date.fromisoformat(start_date)
     if end_date:
@@ -1591,28 +2496,43 @@ def get_attendance_analytics(start_date: str | None = None, end_date: str | None
     conn = get_connection()
     c = conn.cursor()
     session_filters, params = [], []
-    for clause, value in (("sess.class_date >= ?", start_date), ("sess.class_date <= ?", end_date),
-                          ("sess.subject_id = ?", subject_id), ("sess.section = ?", section)):
+    student_filters, student_params = [], []
+    for clause, value in (("ats.class_date >= ?", start_date), ("ats.class_date <= ?", end_date),
+                          ("ats.subject_id = ?", subject_id), ("ats.section = ?", section)):
         if value is not None:
             session_filters.append(clause)
             params.append(value)
-    scoped_sessions = ""
-    if session_filters:
-        scoped_sessions = " AND EXISTS (SELECT 1 FROM attendance_sessions sess WHERE sess.id = ar.session_id AND " + " AND ".join(session_filters) + ")"
-    c.execute("""
+    if class_id is not None:
+        student_filters.append("st.class_id = ?")
+        student_params.append(class_id)
+    if faculty_id is not None:
+        student_filters.append("(EXISTS (SELECT 1 FROM teaching_assignments ta WHERE ta.class_id=st.class_id AND ta.faculty_id=?) OR EXISTS (SELECT 1 FROM academic_classes c WHERE c.id=st.class_id AND c.created_by=?))")
+        student_params.append(faculty_id)
+        student_params.append(faculty_id)
+    query = """
         SELECT
             st.roll_number,
             st.name,
-            COUNT(ar.id) as total_sessions,
-            SUM(CASE WHEN ar.status = 'Present' THEN 1 ELSE 0 END) as present_count,
-            ROUND(CAST(SUM(CASE WHEN ar.status = 'Present' THEN 1 ELSE 0 END) AS NUMERIC) /
-                  CASE WHEN COUNT(ar.id) < 1 THEN 1 ELSE COUNT(ar.id) END * 100, 1) as percentage
+            COUNT(DISTINCT ats.id) as total_sessions,
+            COALESCE(SUM(CASE WHEN ar.status = 'Present' THEN 1 ELSE 0 END), 0) as present_count,
+            ROUND(CAST(COALESCE(SUM(CASE WHEN ar.status = 'Present' THEN 1 ELSE 0 END), 0) AS NUMERIC) /
+                  CASE WHEN COUNT(DISTINCT ats.id) < 1 THEN 1 ELSE COUNT(DISTINCT ats.id) END * 100, 1) as percentage
         FROM students st
-        LEFT JOIN attendance_records ar ON ar.student_id = st.id
-    """ + scoped_sessions + """
+        LEFT JOIN attendance_sessions ats ON
+            (ats.class_id = st.class_id OR (ats.class_id IS NULL AND ats.section = st.section))
+    """
+    if session_filters:
+        query += " AND " + " AND ".join(session_filters)
+    query += """
+        LEFT JOIN attendance_records ar ON ar.session_id = ats.id AND ar.student_id = st.id
+    """
+    if student_filters:
+        query += " WHERE " + " AND ".join(student_filters)
+    query += """
         GROUP BY st.id, st.roll_number, st.name
         ORDER BY percentage ASC
-    """, params)
+    """
+    c.execute(query, params + student_params)
     rows = c.fetchall()
     conn.close()
     return rows
@@ -1676,43 +2596,55 @@ def delete_voice_note(user_id: int, note_id: int) -> None:
     return rows
 
 
-def record_assistant_query_event(category: str = "learning") -> None:
+def record_assistant_query_event(category: str = "learning", *, user_id: int | None = None,
+                                 class_id: int | None = None) -> None:
     if category not in ("learning", "schedule", "exam"):
         raise ValueError("Unknown assistant analytics category.")
     conn = get_connection()
     try:
-        conn.execute("INSERT INTO assistant_query_events(category) VALUES (?)", (category,))
+        if class_id is None and user_id is not None:
+            student = conn.execute("SELECT class_id FROM students WHERE user_id = ?", (user_id,)).fetchone()
+            if student:
+                class_id = student[0]
+        conn.execute("INSERT INTO assistant_query_events(category, user_id, class_id) VALUES (?, ?, ?)",
+                     (category, user_id, class_id))
         conn.execute("DELETE FROM assistant_query_events WHERE created_at < datetime('now', '-90 days')")
         conn.commit()
     finally:
         conn.close()
 
 
-def get_classroom_activity_stats(faculty_id: int) -> dict:
+def get_classroom_activity_stats(faculty_id: int, class_id: int | None = None) -> dict:
     conn = get_connection()
     try:
         role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
         if not role or role[0] != "faculty":
             raise PermissionError("Only faculty can view classroom activity analytics.")
+        if class_id is not None and not conn.execute("""SELECT 1 FROM academic_classes c WHERE c.id=?
+            AND (c.created_by=? OR EXISTS (SELECT 1 FROM teaching_assignments ta WHERE ta.faculty_id=? AND ta.class_id=c.id))""",
+                                                      (class_id, faculty_id, faculty_id)).fetchone():
+            raise PermissionError("This class is not assigned to your faculty account.")
+        class_clause = "class_id = ?" if class_id is not None else "class_id IN (SELECT class_id FROM teaching_assignments WHERE faculty_id = ? UNION SELECT id FROM academic_classes WHERE created_by = ?)"
+        class_params = (class_id,) if class_id is not None else (faculty_id, faculty_id)
         return {
             "learning_queries_today": conn.execute(
-                "SELECT COUNT(*) FROM assistant_query_events WHERE category = 'learning' AND date(created_at, 'localtime') = date('now', 'localtime')"
-            ).fetchone()[0],
+                f"SELECT COUNT(*) FROM assistant_query_events WHERE category = 'learning' AND date(created_at, 'localtime') = date('now', 'localtime') AND {class_clause}"
+            , class_params).fetchone()[0],
             "schedule_queries_today": conn.execute(
-                "SELECT COUNT(*) FROM assistant_query_events WHERE category = 'schedule' AND date(created_at, 'localtime') = date('now', 'localtime')"
-            ).fetchone()[0],
+                f"SELECT COUNT(*) FROM assistant_query_events WHERE category = 'schedule' AND date(created_at, 'localtime') = date('now', 'localtime') AND {class_clause}"
+            , class_params).fetchone()[0],
             "exam_queries_today": conn.execute(
-                "SELECT COUNT(*) FROM assistant_query_events WHERE category = 'exam' AND date(created_at, 'localtime') = date('now', 'localtime')"
-            ).fetchone()[0],
+                f"SELECT COUNT(*) FROM assistant_query_events WHERE category = 'exam' AND date(created_at, 'localtime') = date('now', 'localtime') AND {class_clause}"
+            , class_params).fetchone()[0],
             "lab_submissions_today": conn.execute(
-                "SELECT COUNT(*) FROM lab_submissions WHERE date(completed_at, 'localtime') = date('now', 'localtime')"
-            ).fetchone()[0],
+                f"SELECT COUNT(*) FROM lab_submissions sub JOIN lab_experiments e ON e.id=sub.experiment_id JOIN students st ON st.id=sub.student_id WHERE date(sub.completed_at, 'localtime') = date('now', 'localtime') AND {('(st.class_id = ? AND (e.class_id = ? OR e.class_id IS NULL))' if class_id is not None else 'st.class_id IN (SELECT class_id FROM teaching_assignments WHERE faculty_id = ? UNION SELECT id FROM academic_classes WHERE created_by = ?)')}"
+            , ((class_id, class_id) if class_id is not None else class_params)).fetchone()[0],
             "attendance_sessions_today": conn.execute(
-                "SELECT COUNT(*) FROM attendance_sessions WHERE class_date = CAST(date('now', 'localtime') AS TEXT)"
-            ).fetchone()[0],
+                f"SELECT COUNT(*) FROM attendance_sessions WHERE class_date = CAST(date('now', 'localtime') AS TEXT) AND {class_clause}"
+                , class_params).fetchone()[0],
             "assignment_submissions_today": conn.execute(
-                "SELECT COUNT(*) FROM assignment_submissions WHERE date(submitted_at, 'localtime') = date('now', 'localtime')"
-            ).fetchone()[0],
+                f"SELECT COUNT(*) FROM assignment_submissions sub JOIN assignments a ON a.id=sub.assignment_id WHERE date(sub.submitted_at, 'localtime') = date('now', 'localtime') AND {('a.class_id = ?' if class_id is not None else 'a.class_id IN (SELECT class_id FROM teaching_assignments WHERE faculty_id = ? UNION SELECT id FROM academic_classes WHERE created_by = ?)')}"
+            , class_params).fetchone()[0],
         }
     finally:
         conn.close()
@@ -1724,6 +2656,11 @@ def get_assignment_submissions(assignment_id: int, faculty_id: int):
         role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
         if not role or role[0] != "faculty":
             raise PermissionError("Only faculty can view assignment submissions.")
+        assigned = conn.execute("""SELECT 1 FROM assignments a
+            JOIN teaching_assignments ta ON ta.class_id=a.class_id AND ta.subject_id=a.subject_id
+            WHERE a.id=? AND ta.faculty_id=?""", (assignment_id, faculty_id)).fetchone()
+        if not assigned:
+            raise PermissionError("You can review submissions only for your assigned classes.")
         return conn.execute("""
             SELECT sub.id, st.roll_number, st.name, sub.submission_text, sub.file_path,
                    sub.submitted_at, sub.marks, sub.feedback, sub.graded_at
@@ -1743,10 +2680,11 @@ def get_student_lab_progress(user_id: int):
         if not role or role[0] != "student":
             raise PermissionError("A student account is required to view personal lab progress.")
         return conn.execute("""SELECT e.id, s.code, s.name, e.exp_number, e.title, e.description,
-            COALESCE(sub.status, 'Not started'), COALESCE(sub.code_snippet, '')
+            COALESCE(sub.status, 'Not started'), COALESCE(sub.code_snippet, ''), e.manual_path
             FROM lab_experiments e JOIN subjects s ON s.id = e.subject_id
-            LEFT JOIN students st ON st.user_id = ?
+            LEFT JOIN students st ON st.user_id = ? AND (e.class_id IS NULL OR e.class_id = st.class_id)
             LEFT JOIN lab_submissions sub ON sub.experiment_id = e.id AND sub.student_id = st.id
+            WHERE e.class_id IS NULL OR e.class_id = st.class_id
             ORDER BY s.code, e.exp_number""", (user_id,)).fetchall()
     finally:
         conn.close()
@@ -1760,7 +2698,9 @@ def submit_lab_experiment(experiment_id: int, user_id: int, work_notes: str) -> 
         student = conn.execute("SELECT st.id FROM students st JOIN users u ON u.id = st.user_id WHERE st.user_id = ? AND u.role = 'student'", (user_id,)).fetchone()
         if not student:
             raise PermissionError("A student account is required to submit lab work.")
-        if not conn.execute("SELECT 1 FROM lab_experiments WHERE id = ?", (experiment_id,)).fetchone():
+        if not conn.execute("""SELECT 1 FROM lab_experiments e JOIN students st ON st.user_id = ?
+            WHERE e.id = ? AND (e.class_id IS NULL OR e.class_id = st.class_id)""",
+            (user_id, experiment_id)).fetchone():
             raise ValueError("Select a valid lab experiment.")
         previous = conn.execute("SELECT status FROM lab_submissions WHERE experiment_id = ? AND student_id = ?", (experiment_id, student[0])).fetchone()
         if previous and previous[0] == "Completed":
@@ -1786,10 +2726,13 @@ def get_lab_submission_reviews(faculty_id: int):
         if not role or role[0] != "faculty":
             raise PermissionError("Only faculty can review student lab work.")
         return conn.execute("""SELECT sub.id, st.roll_number, st.name, s.code, e.title,
-            sub.code_snippet, sub.completed_at, sub.status FROM lab_submissions sub
+            sub.code_snippet, sub.completed_at, sub.status, e.id, e.class_id FROM lab_submissions sub
             JOIN students st ON st.id = sub.student_id JOIN lab_experiments e ON e.id = sub.experiment_id
-            JOIN subjects s ON s.id = e.subject_id WHERE sub.status IN ('Submitted for Review','Needs Revision')
-            ORDER BY sub.completed_at""").fetchall()
+            JOIN subjects s ON s.id = e.subject_id
+            JOIN teaching_assignments ta ON ta.class_id = e.class_id AND ta.subject_id=e.subject_id
+                AND ta.faculty_id = ?
+            WHERE sub.status IN ('Submitted for Review','Needs Revision')
+            ORDER BY sub.completed_at""", (faculty_id,)).fetchall()
     finally:
         conn.close()
 
@@ -1802,6 +2745,13 @@ def review_lab_submission(submission_id: int, faculty_id: int, decision: str) ->
         role = conn.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
         if not role or role[0] != "faculty":
             raise PermissionError("Only faculty can review student lab work.")
+        assigned = conn.execute("""SELECT 1 FROM lab_submissions sub
+            JOIN lab_experiments e ON e.id = sub.experiment_id
+            JOIN teaching_assignments ta ON ta.class_id = e.class_id
+                AND ta.subject_id = e.subject_id AND ta.faculty_id = ?
+            WHERE sub.id = ?""", (faculty_id, submission_id)).fetchone()
+        if not assigned:
+            raise PermissionError("You can review lab work only for a class and subject assigned to you.")
         cursor = conn.execute("UPDATE lab_submissions SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('Submitted for Review','Needs Revision')",
                               (decision, submission_id))
         if cursor.rowcount != 1:
@@ -1970,12 +2920,20 @@ def grade_submission(submission_id: int, marks: float, feedback: str, faculty_id
         conn.close()
         raise PermissionError("Only faculty can grade assignment submissions.")
     c.execute("""
-        SELECT a.max_marks FROM assignment_submissions s
+        SELECT a.max_marks, a.class_id, a.subject_id FROM assignment_submissions s
         JOIN assignments a ON a.id = s.assignment_id
         WHERE s.id = ?
     """, (submission_id,))
     assignment = c.fetchone()
-    if not assignment or marks < 0 or marks > assignment[0]:
+    if not assignment:
+        conn.close()
+        raise ValueError("The submission could not be found.")
+    assigned = c.execute("SELECT 1 FROM teaching_assignments WHERE class_id=? AND subject_id=? AND faculty_id=?",
+                         (assignment[1], assignment[2], faculty_id)).fetchone()
+    if not assigned:
+        conn.close()
+        raise PermissionError("You can grade submissions only for your assigned classes.")
+    if marks < 0 or marks > assignment[0]:
         conn.close()
         raise ValueError("The score must be within the assignment’s mark limit.")
     c.execute("""
@@ -1991,13 +2949,22 @@ def grade_submission(submission_id: int, marks: float, feedback: str, faculty_id
 
 def add_question_bank_item(subject_id: int, unit_number: int, question: str, answer_key: str,
                           difficulty: str = "Medium", marks: int = 5, faculty_id: int | None = None,
-                          source_kind: str = "Model", exam_year: int | None = None):
+                          source_kind: str = "Model", exam_year: int | None = None,
+                          class_id: int | None = None):
     conn = get_connection()
     c = conn.cursor()
     try:
         role = c.execute("SELECT role FROM users WHERE id = ?", (faculty_id,)).fetchone()
         if not role or role[0] != "faculty":
             raise PermissionError("Only faculty can add question-bank items.")
+        if class_id is None:
+            choices = c.execute("SELECT class_id FROM teaching_assignments WHERE subject_id=? AND faculty_id=?",
+                                (subject_id, faculty_id)).fetchall()
+            if len(choices) == 1:
+                class_id = choices[0][0]
+        if class_id is None or not c.execute("""SELECT 1 FROM teaching_assignments
+            WHERE class_id=? AND subject_id=? AND faculty_id=?""", (class_id, subject_id, faculty_id)).fetchone():
+            raise PermissionError("Choose a class and subject assigned to your faculty account.")
         if source_kind not in ("Model", "Previous Year"):
             raise ValueError("Question source must be Model or Previous Year.")
         if source_kind == "Previous Year" and (exam_year is None or not 2000 <= int(exam_year) <= date.today().year):
@@ -2005,9 +2972,9 @@ def add_question_bank_item(subject_id: int, unit_number: int, question: str, ans
         if source_kind == "Model":
             exam_year = None
         c.execute("""INSERT INTO question_banks
-            (subject_id, unit_number, question, answer_key, difficulty, marks, source_kind, exam_year)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                  (subject_id, unit_number, question, answer_key, difficulty, marks, source_kind, exam_year))
+            (subject_id, unit_number, question, answer_key, difficulty, marks, source_kind, exam_year, class_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (subject_id, unit_number, question, answer_key, difficulty, marks, source_kind, exam_year, class_id))
         _audit(c, faculty_id, "question_bank.created", f"question={c.lastrowid}; subject={subject_id}")
         conn.commit()
     except Exception:
@@ -2039,7 +3006,7 @@ def toggle_reminder_completed(reminder_id: int, user_id: int):
 # STUDENT MANAGEMENT CRUD
 # ============================================================
 
-def add_student(username: str, roll_number: str, name: str, department: str = "CSE", year: int = 3, section: str = "C", password: str = "student123", faculty_id: int | None = None):
+def add_student(username: str, roll_number: str, name: str, department: str = "CSE", year: int = 3, section: str = "C", password: str = "student123", faculty_id: int | None = None, class_id: int | None = None):
     conn = get_connection()
     c = conn.cursor()
     try:
@@ -2049,13 +3016,23 @@ def add_student(username: str, roll_number: str, name: str, department: str = "C
             raise PermissionError("Only faculty can create student accounts.")
         if not password:
             raise ValueError("A temporary password is required.")
+        if class_id is None:
+            class_id = _get_or_create_academic_class(c, department, year, section)
+        else:
+            academic_class = c.execute("SELECT department, year_of_study, section FROM academic_classes WHERE id = ?", (class_id,)).fetchone()
+            if not academic_class or (academic_class[0], int(academic_class[1]), academic_class[2]) != (department, int(year), section):
+                raise ValueError("The selected academic class does not match the student details.")
+            if not c.execute("""SELECT 1 FROM academic_classes cls WHERE cls.id=?
+                AND (cls.created_by=? OR EXISTS (SELECT 1 FROM teaching_assignments ta WHERE ta.class_id=cls.id AND ta.faculty_id=?))""",
+                             (class_id, faculty_id, faculty_id)).fetchone():
+                raise PermissionError("Enroll students only in a class you created or teach.")
         c.execute("INSERT INTO users (username, password, role, name) VALUES (?, ?, 'student', ?)",
                   (username, hash_password(password), name))
         user_id = c.lastrowid
         c.execute("""
-            INSERT INTO students (user_id, roll_number, name, department, year, section)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (user_id, roll_number, name, department, year, section))
+            INSERT INTO students (user_id, roll_number, name, department, year, section, class_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, roll_number, name, department, year, section, class_id))
         student_id = c.lastrowid
         _audit(c, faculty_id, "student.created", f"student={student_id}; username={username}")
         conn.commit()
@@ -2067,7 +3044,7 @@ def add_student(username: str, roll_number: str, name: str, department: str = "C
         raise e
 
 
-def update_student(student_id: int, roll_number: str, name: str, department: str, year: int, section: str, faculty_id: int | None = None):
+def update_student(student_id: int, roll_number: str, name: str, department: str, year: int, section: str, faculty_id: int | None = None, class_id: int | None = None):
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT role FROM users WHERE id = ?", (faculty_id,))
@@ -2075,11 +3052,27 @@ def update_student(student_id: int, roll_number: str, name: str, department: str
     if not role or role[0] != "faculty":
         conn.close()
         raise PermissionError("Only faculty can update student records.")
+    if class_id is None:
+        prior = c.execute("SELECT class_id FROM students WHERE id = ?", (student_id,)).fetchone()
+        session = None
+        if prior and prior[0]:
+            session = c.execute("SELECT academic_year FROM academic_classes WHERE id = ?", (prior[0],)).fetchone()
+        class_id = _get_or_create_academic_class(c, department, year, section, session[0] if session else None)
+    else:
+        academic_class = c.execute("SELECT department, year_of_study, section FROM academic_classes WHERE id = ?", (class_id,)).fetchone()
+        if not academic_class or (academic_class[0], int(academic_class[1]), academic_class[2]) != (department, int(year), section):
+            conn.close()
+            raise ValueError("The selected academic class does not match the student details.")
+        if not c.execute("""SELECT 1 FROM academic_classes cls WHERE cls.id=?
+            AND (cls.created_by=? OR EXISTS (SELECT 1 FROM teaching_assignments ta WHERE ta.class_id=cls.id AND ta.faculty_id=?))""",
+                         (class_id, faculty_id, faculty_id)).fetchone():
+            conn.close()
+            raise PermissionError("Move students only into a class you created or teach.")
     c.execute("""
         UPDATE students
-        SET roll_number = ?, name = ?, department = ?, year = ?, section = ?
+        SET roll_number = ?, name = ?, department = ?, year = ?, section = ?, class_id = ?
         WHERE id = ?
-    """, (roll_number, name, department, year, section, student_id))
+    """, (roll_number, name, department, year, section, class_id, student_id))
     # Update corresponding user record name as well
     c.execute("""
         UPDATE users
@@ -2116,24 +3109,36 @@ def delete_student(student_id: int, faculty_id: int | None = None):
 # LIVE DASHBOARD STATS
 # ============================================================
 
-def get_dashboard_stats_faculty():
+def get_dashboard_stats_faculty(faculty_id: int | None = None):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM students")
+    if faculty_id is None:
+        c.execute("SELECT COUNT(*) FROM students")
+    else:
+        c.execute("""SELECT COUNT(*) FROM students st WHERE st.class_id IN (
+            SELECT class_id FROM teaching_assignments WHERE faculty_id = ?
+            UNION SELECT id FROM academic_classes WHERE created_by = ?)""", (faculty_id, faculty_id))
     total_students = c.fetchone()[0]
 
     c.execute("""
         SELECT COUNT(ar.id), SUM(CASE WHEN ar.status = 'Present' THEN 1 ELSE 0 END)
         FROM attendance_records ar
-    """)
+        JOIN attendance_sessions ats ON ats.id = ar.session_id
+        JOIN (SELECT DISTINCT class_id, subject_id, faculty_id FROM teaching_assignments) ta
+            ON ta.class_id = ats.class_id AND ta.subject_id = ats.subject_id
+        WHERE (? IS NULL OR ta.faculty_id = ?)
+    """, (faculty_id, faculty_id))
     row = c.fetchone()
     total_recs, present_recs = row[0] or 0, row[1] or 0
     att_pct = round((present_recs / total_recs * 100), 1) if total_recs > 0 else None
 
-    c.execute("SELECT COUNT(*) FROM assignments")
+    if faculty_id is None:
+        c.execute("SELECT COUNT(*) FROM assignments")
+    else:
+        c.execute("SELECT COUNT(*) FROM assignments WHERE faculty_id = ?", (faculty_id,))
     total_assignments = c.fetchone()[0]
 
-    c.execute("SELECT COUNT(*) FROM announcements")
+    c.execute("SELECT COUNT(*) FROM announcements WHERE (? IS NULL OR faculty_id = ?)", (faculty_id, faculty_id))
     total_notices = c.fetchone()[0]
 
     conn.close()
@@ -2150,7 +3155,7 @@ def get_dashboard_stats_student(user_id: int):
     conn = get_connection()
     c = conn.cursor()
 
-    c.execute("SELECT id FROM students WHERE user_id = ?", (user_id,))
+    c.execute("SELECT id, class_id, section FROM students WHERE user_id = ?", (user_id,))
     st = c.fetchone()
     if not st:
         conn.close()
@@ -2159,34 +3164,41 @@ def get_dashboard_stats_student(user_id: int):
             "pending_assignments": 0, "completed_labs": 0,
             "total_labs": 0, "lab_pct": 0, "academic_average": None,
         }
-    student_id = st[0]
+    student_id, class_id, section = st[0], st[1], st[2]
 
     c.execute("""
         SELECT COUNT(ar.id), SUM(CASE WHEN ar.status = 'Present' THEN 1 ELSE 0 END)
-        FROM attendance_records ar
-        WHERE ar.student_id = ?
-    """, (student_id,))
+        FROM attendance_records ar JOIN attendance_sessions ats ON ats.id = ar.session_id
+        WHERE ar.student_id = ? AND (ats.class_id = ? OR (ats.class_id IS NULL AND ats.section = ?))
+    """, (student_id, class_id, section))
     row = c.fetchone()
     total_recs, present_recs = row[0] or 0, row[1] or 0
     att_pct = round((present_recs / total_recs * 100), 1) if total_recs > 0 else None
 
-    c.execute("SELECT COUNT(*) FROM assignments")
+    c.execute("SELECT COUNT(*) FROM assignments WHERE class_id IS NULL OR class_id = ?", (class_id,))
     total_assignments = c.fetchone()[0]
 
-    c.execute("SELECT COUNT(*) FROM assignment_submissions WHERE student_id = ?", (student_id,))
+    c.execute("""SELECT COUNT(*) FROM assignment_submissions sub
+        JOIN assignments a ON a.id = sub.assignment_id
+        WHERE sub.student_id = ? AND (a.class_id IS NULL OR a.class_id = ?)""", (student_id, class_id))
     submitted = c.fetchone()[0]
 
     pending_assignments = max(0, total_assignments - submitted)
 
-    c.execute("SELECT COUNT(*) FROM lab_submissions WHERE student_id = ? AND status = 'Completed'", (student_id,))
+    c.execute("""SELECT COUNT(*) FROM lab_submissions sub JOIN lab_experiments e ON e.id=sub.experiment_id
+        WHERE sub.student_id = ? AND sub.status = 'Completed' AND (e.class_id IS NULL OR e.class_id = ?)""",
+        (student_id, class_id))
     completed_labs = c.fetchone()[0]
 
-    c.execute("SELECT COUNT(*) FROM lab_experiments")
+    c.execute("SELECT COUNT(*) FROM lab_experiments WHERE class_id IS NULL OR class_id = ?", (class_id,))
     total_labs = c.fetchone()[0]
 
     lab_pct = round((completed_labs / total_labs * 100), 0) if total_labs else 0
 
-    c.execute("SELECT AVG(total_mark) / 3.0 FROM academics WHERE student_id = ?", (student_id,))
+    c.execute("""SELECT AVG(a.total_mark) / 3.0 FROM academics a
+        JOIN (SELECT DISTINCT class_id, subject_id FROM teaching_assignments) ta
+            ON ta.subject_id = a.subject_id AND ta.class_id = ?
+        WHERE a.student_id = ?""", (class_id, student_id))
     academic_average = c.fetchone()[0]
 
     conn.close()

@@ -26,14 +26,20 @@ Local managed files (course uploads and assignment attachments)
 | --- | --- | --- |
 | Startup | `main.py` | Starts Qt, initializes configured stores, reports startup errors, and opens login. |
 | Authentication | `gui/login.py`, `database/database.py` | Verifies salted PBKDF2-SHA256 password hashes and selects the faculty or student workspace. |
-| Faculty workspace | `gui/faculty_dashboard.py` | Student directory, attendance, analytics, academics, assignments, notes, notices, timetable, workstation, voice, exam management, and lab review. |
+| Faculty workspace | `gui/faculty_dashboard.py` | Class-scoped student directory, attendance, analytics, academic records, assignments, course materials, notices, timetable, voice tools, online exams, and academic structure. |
 | Student workspace | `gui/student_dashboard.py` | Personal attendance and academics, assignments, course materials, code runner, labs, schedule, practical exams, voice tools, and private notes. |
-| Data access | `database/database.py` | Creates and migrates schemas, performs parameterized queries, enforces role checks, records audit events, and seeds demo data. |
+| Data access | `database/database.py` | Creates and migrates schemas, performs parameterized queries, enforces role and class scope, records audit events, and seeds demo data. |
 | PostgreSQL adapter | `database/postgres_compat.py` | Translates the current SQLite-shaped data-layer SQL into the subset used with PostgreSQL. It is a compatibility layer, not a replacement for a future versioned migration/service architecture. |
 | Course retrieval | `ai/rag_engine.py`, `ai/tutor_engine.py` | Indexes readable local text/PDF material and returns matching FAQs, document passages, and question-bank results with source labels. Retrieval is local; no generative language model is bundled. |
 | File storage | `storage/local_storage.py` | Copies allowed uploads under opaque random keys, checks size and path containment, and stores file metadata in the configured shared database. |
 | Optional code execution | `lab/code_runner.py`, `docker/Dockerfile.runner` | Runs student code only in the restricted Docker image when Docker and that image are available. |
 | Voice | `voice/`, `gui/speech_worker.py` | Handles typed commands and optional local Vosk microphone input. Recognized commands are shown for review, and sensitive actions require confirmation. |
+
+## Academic structure
+
+`academic_classes` identifies a cohort by department/program, year of study, section, and academic year. Each student record points to one class. `faculty_profiles` stores staff ID, department, and designation, while `teaching_assignments` links a faculty member and subject to a class and term. A faculty member can create a class, enroll students into that exact class, and assign subjects to faculty. An authorized one-time reset clears previous academic records before the new demo class data is created.
+
+Assignments, attendance, academic marks, timetables, notes, question banks, notices, RAG retrieval, and online exams now use the class/teaching assignment to scope data. Student screens use the signed-in student's class. Faculty screens use classes the faculty member created or teaches.
 
 ## Data placement
 
@@ -61,7 +67,7 @@ Without overrides, app data is stored in `%LOCALAPPDATA%\\EduPilot` on Windows, 
 - Passwords are stored as salted PBKDF2-SHA256 hashes; comparisons use constant-time checks.
 - Data values are passed as SQL parameters. Faculty-only data operations check the account role in the data layer; student record queries are scoped to the signed-in user.
 - Attendance QR tokens are section-bound, HMAC-SHA256 signed, and expire after five minutes. They do not prove student identity and can be shared during their validity window.
-- Face recognition is disabled. Face detection alone is not used to identify a student.
+- Face matching uses an optional OpenCV contrib LBPH model. Student crops are encrypted in device-local SQLite after faculty confirms opt-in, expire after 90 days, and are deleted when expired or when the student record is removed. Recognition only proposes a candidate; faculty must confirm attendance. It does not detect photo spoofing or prove liveness.
 - Managed uploads are extension-allowlisted, limited to 25 MB, copied under random names, and never executed as a program by EduPilot.
 - The code runner has no network access, a read-only base filesystem, a temporary workspace, resource limits, and an execution timeout. It has no host-shell fallback.
 - Practical exams persist an attempt deadline and autosave drafts. The fullscreen interface restricts normal in-app navigation but is not an OS kiosk and cannot prevent operating-system task switching or administrator actions.
@@ -69,4 +75,4 @@ Without overrides, app data is stored in `%LOCALAPPDATA%\\EduPilot` on Windows, 
 
 ## Supported and optional capabilities
 
-Core desktop features use `requirements.txt`. Offline microphone recognition, text-to-speech, and camera scanning use optional dependencies from `requirements-optional.txt`; voice recognition also needs a separately installed Vosk model. Student code execution needs Docker and the `edupilot-runner` image. Face identity matching, OS-level exam lockdown, cloud synchronization, and automatic multi-device file sharing are not implemented.
+Core desktop features use `requirements.txt`. Offline microphone recognition, text-to-speech, camera scanning, and face matching use optional dependencies from `requirements-optional.txt`; voice recognition also needs a separately installed Vosk model. Face matching additionally needs per-student opt-in enrollment on each device and a functioning OS credential vault for its encryption key. Student code execution needs Docker and the `edupilot-runner` image. OS-level exam lockdown, cloud synchronization, and automatic multi-device file sharing are not implemented.

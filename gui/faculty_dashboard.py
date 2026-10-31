@@ -8,11 +8,11 @@ from PySide6.QtCore import Qt, QTime, QTimer
 from gui.attendance import AttendanceWindow
 from gui.analytics_widget import ClassroomAnalyticsWidget
 from gui.academics_widget import AcademicTrackerWidget
-from gui.lab_monitor_widget import LabMonitorWidget
-from gui.lab_exam_widget import FacultyLabExamWidget
-from gui.lab_review_widget import LabSubmissionReviewWidget
+from gui.online_exam_management_widget import OnlineExamManagementWidget
+from gui.lab_manuals_widget import LabManualsWidget
 from gui.voice_notes_widget import VoiceNotesWidget
 from gui.speech_worker import SpeechInputWorker
+from gui.voice_device import MicrophoneSelector
 from gui.assignments_widget import AssignmentsWidget
 from gui.notes_qbank_widget import NotesAndQuestionBankWidget
 from gui.notices_widget import NoticesAndRemindersWidget
@@ -23,8 +23,10 @@ from voice.commands import execute_voice_intent
 from database.database import (
     get_timetables, get_subjects, get_assignments, get_notes, add_announcement,
     add_timetable_entry, update_timetable_entry, delete_timetable_entry,
-    get_dashboard_stats_faculty, get_students, add_student, update_student, delete_student
+    get_dashboard_stats_faculty, get_students, add_student, update_student, delete_student,
+    get_academic_classes,
 )
+from gui.academic_structure_widget import AcademicStructureWidget
 from gui.theme import POSITIVUS_QSS, create_pill_badge, create_section_header, create_content_scroll_area, COLOR_PRIMARY, COLOR_SECONDARY, COLOR_NEUTRAL_BG, style_action_button
 from voice.speech_input import speech_input_status
 
@@ -45,11 +47,13 @@ class StudentDirectoryWidget(QWidget):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(16)
 
-        header = create_section_header("Student Directory & Records Management", "Create, search, update, or remove student accounts in SQLite database")
+        header = create_section_header("Student Directory & Records Management", "Create, search, update, or remove student accounts")
         layout.addWidget(header)
 
         # Top Bar: Search + Add Button
         top_bar = QHBoxLayout()
+        self.class_filter = QComboBox()
+        self.class_filter.currentIndexChanged.connect(self.filter_students)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search student by name or roll number...")
         self.search_input.textChanged.connect(self.filter_students)
@@ -59,14 +63,16 @@ class StudentDirectoryWidget(QWidget):
         btn_add.setProperty("class", "secondary")
         btn_add.clicked.connect(self.show_add_student_dialog)
 
+        top_bar.addWidget(QLabel("Class:"))
+        top_bar.addWidget(self.class_filter)
         top_bar.addWidget(self.search_input, 1)
         top_bar.addWidget(btn_add)
         layout.addLayout(top_bar)
 
         # Student Table
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(["ID", "Roll Number", "Name", "Department", "Year", "Section", "Actions"])
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels(["ID", "Roll Number", "Name", "Department", "Year", "Section", "Academic Class", "Actions"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         layout.addWidget(self.table)
@@ -75,11 +81,29 @@ class StudentDirectoryWidget(QWidget):
 
     def load_students(self):
         self.all_students = get_students(faculty_id=self.faculty_id)
+        selected = self.class_filter.currentData()
+        self.class_filter.blockSignals(True)
+        self.class_filter.clear()
+        self.class_filter.addItem("All classes", None)
+        self.classes = get_academic_classes(faculty_id=self.faculty_id)
+        self.class_labels = {
+            row[0]: f"{row[1]} · Year {row[2]} · Section {row[3]} · {row[4]}"
+            for row in self.classes
+        }
+        for class_row in self.classes:
+            self.class_filter.addItem(self.class_labels[class_row[0]], class_row[0])
+        index = self.class_filter.findData(selected)
+        if index >= 0:
+            self.class_filter.setCurrentIndex(index)
+        self.class_filter.blockSignals(False)
         self.filter_students()
 
     def filter_students(self):
         query = self.search_input.text().lower().strip()
-        filtered = [s for s in self.all_students if query in s[1].lower() or query in s[2].lower() or query in s[3].lower()]
+        selected_class = self.class_filter.currentData()
+        filtered = [s for s in self.all_students
+                    if (selected_class is None or (len(s) > 6 and s[6] == selected_class))
+                    and (query in s[1].lower() or query in s[2].lower() or query in s[3].lower())]
 
         self.table.setRowCount(len(filtered))
         for row, st in enumerate(filtered):
@@ -110,12 +134,14 @@ class StudentDirectoryWidget(QWidget):
 
             act_layout.addWidget(btn_edit)
             act_layout.addWidget(btn_del)
-            self.table.setCellWidget(row, 6, action_widget)
+            class_label = self.class_labels.get(st[6], "Unassigned") if len(st) > 6 else "Unassigned"
+            self.table.setItem(row, 6, QTableWidgetItem(class_label))
+            self.table.setCellWidget(row, 7, action_widget)
 
     def show_add_student_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Add New Student Record")
-        dialog.setMinimumSize(420, 380)
+        dialog.setMinimumSize(460, 360)
         d_layout = QVBoxLayout(dialog)
 
         title = QLabel("Create Student Account")
@@ -128,11 +154,12 @@ class StudentDirectoryWidget(QWidget):
         inp_roll.setPlaceholderText("Roll Number (e.g. 23CSE006)...")
         inp_name = QLineEdit()
         inp_name.setPlaceholderText("Full Name...")
-        inp_dept = QLineEdit("CSE")
-        inp_year = QComboBox()
-        inp_year.addItems(["1", "2", "3", "4"])
-        inp_year.setCurrentText("3")
-        inp_sec = QLineEdit("C")
+        inp_class = QComboBox()
+        for class_row in get_academic_classes(faculty_id=self.faculty_id):
+            inp_class.addItem(
+                f"{class_row[1]} · Year {class_row[2]} · Section {class_row[3]} · {class_row[4]}",
+                class_row,
+            )
         inp_pass = QLineEdit("student123")
 
         d_layout.addWidget(QLabel("Username:"))
@@ -141,13 +168,10 @@ class StudentDirectoryWidget(QWidget):
         d_layout.addWidget(inp_roll)
         d_layout.addWidget(QLabel("Full Name:"))
         d_layout.addWidget(inp_name)
-        d_layout.addWidget(QLabel("Department:"))
-        d_layout.addWidget(inp_dept)
-        d_layout.addWidget(QLabel("Year & Section:"))
-        h = QHBoxLayout()
-        h.addWidget(inp_year)
-        h.addWidget(inp_sec)
-        d_layout.addLayout(h)
+        d_layout.addWidget(QLabel("Academic class:"))
+        d_layout.addWidget(inp_class)
+        if inp_class.count() == 0:
+            d_layout.addWidget(QLabel("Create a class in Academic Structure before enrolling students."))
         d_layout.addWidget(QLabel("Initial Password:"))
         d_layout.addWidget(inp_pass)
 
@@ -155,11 +179,12 @@ class StudentDirectoryWidget(QWidget):
         btn_save.setProperty("class", "secondary")
         def save():
             u, r, n = inp_user.text().strip(), inp_roll.text().strip(), inp_name.text().strip()
-            if not u or not r or not n:
-                QMessageBox.warning(dialog, "Warning", "Username, Roll Number, and Name are required.")
+            class_row = inp_class.currentData()
+            if not u or not r or not n or not class_row:
+                QMessageBox.warning(dialog, "Warning", "Username, Roll Number, Name, and an academic class are required.")
                 return
             try:
-                add_student(u, r, n, inp_dept.text().strip(), int(inp_year.currentText()), inp_sec.text().strip(), inp_pass.text(), self.faculty_id)
+                add_student(u, r, n, class_row[1], int(class_row[2]), class_row[3], inp_pass.text(), self.faculty_id, class_id=class_row[0])
                 QMessageBox.information(self, "Success", f"Student '{n}' created successfully!")
                 dialog.accept()
                 self.load_students()
@@ -182,33 +207,36 @@ class StudentDirectoryWidget(QWidget):
 
         inp_roll = QLineEdit(st[1])
         inp_name = QLineEdit(st[2])
-        inp_dept = QLineEdit(st[3])
-        inp_year = QComboBox()
-        inp_year.addItems(["1", "2", "3", "4"])
-        inp_year.setCurrentText(str(st[4]))
-        inp_sec = QLineEdit(st[5])
+        inp_class = QComboBox()
+        class_rows = get_academic_classes(faculty_id=self.faculty_id)
+        for class_row in class_rows:
+            inp_class.addItem(
+                f"{class_row[1]} · Year {class_row[2]} · Section {class_row[3]} · {class_row[4]}",
+                class_row,
+            )
+        if len(st) > 6:
+            for index, class_row in enumerate(class_rows):
+                if class_row[0] == st[6]:
+                    inp_class.setCurrentIndex(index)
+                    break
 
         d_layout.addWidget(QLabel("Roll Number:"))
         d_layout.addWidget(inp_roll)
         d_layout.addWidget(QLabel("Full Name:"))
         d_layout.addWidget(inp_name)
-        d_layout.addWidget(QLabel("Department:"))
-        d_layout.addWidget(inp_dept)
-        d_layout.addWidget(QLabel("Year & Section:"))
-        h = QHBoxLayout()
-        h.addWidget(inp_year)
-        h.addWidget(inp_sec)
-        d_layout.addLayout(h)
+        d_layout.addWidget(QLabel("Academic class:"))
+        d_layout.addWidget(inp_class)
 
         btn_save = QPushButton("Save Changes")
         btn_save.setProperty("class", "secondary")
         def save():
             r, n = inp_roll.text().strip(), inp_name.text().strip()
-            if not r or not n:
-                QMessageBox.warning(dialog, "Warning", "Roll Number and Name are required.")
+            class_row = inp_class.currentData()
+            if not r or not n or not class_row:
+                QMessageBox.warning(dialog, "Warning", "Roll Number, Name, and an academic class are required.")
                 return
             try:
-                update_student(st[0], r, n, inp_dept.text().strip(), int(inp_year.currentText()), inp_sec.text().strip(), self.faculty_id)
+                update_student(st[0], r, n, class_row[1], int(class_row[2]), class_row[3], self.faculty_id, class_id=class_row[0])
                 QMessageBox.information(self, "Success", "Student record updated!")
                 dialog.accept()
                 self.load_students()
@@ -317,13 +345,13 @@ class FacultyDashboard(QMainWindow):
             ("Assignments and Grading", 5),
             ("Knowledge Base and Notes", 6),
             ("Notices and Reminders", 7),
-            ("Lab Workstation", 8),
-            ("AI Tutor / Local RAG", 9),
-            ("Schedule / Timetable", 10),
-            ("Voice Assistant", 11),
-            ("Voice Notes", 12),
-            ("Practical Exam Management", 13),
-            ("Lab Submission Review", 14),
+            ("AI Study Tutor", 8),
+            ("Schedule / Timetable", 9),
+            ("Voice Assistant", 10),
+            ("Voice Notes", 11),
+            ("Online Exam Management", 12),
+            ("Academic Structure", 13),
+            ("Lab Manuals & Progress", 14),
         ]
 
         self.nav_buttons = []
@@ -361,19 +389,40 @@ class FacultyDashboard(QMainWindow):
         # ---------------- STACKED PAGES ----------------
         self.stack = QStackedWidget()
 
-        pages = (
-            self._build_overview_page(), self._build_attendance_page(),
-            StudentDirectoryWidget(self.user[0]), ClassroomAnalyticsWidget(self.user[0]),
-            AcademicTrackerWidget(self.user, role="faculty"),
-            AssignmentsWidget(self.user, role="faculty"),
-            NotesAndQuestionBankWidget(self.user, role="faculty"),
-            NoticesAndRemindersWidget(self.user, role="faculty"),
-            LabMonitorWidget(), self._build_ai_rag_page(),
-            self._build_timetable_page(), self._build_voice_page(),
-            VoiceNotesWidget(self.user), FacultyLabExamWidget(self.user[0]),
-            LabSubmissionReviewWidget(self.user[0]),
+        page_builders = (
+            ("Overview", self._build_overview_page),
+            ("Attendance Register", self._build_attendance_page),
+            ("Student Directory", lambda: StudentDirectoryWidget(self.user[0])),
+            ("Classroom Analytics", lambda: ClassroomAnalyticsWidget(self.user[0])),
+            ("Academic Records", lambda: AcademicTrackerWidget(self.user, role="faculty")),
+            ("Assignments and Grading", lambda: AssignmentsWidget(self.user, role="faculty")),
+            ("Knowledge Base and Notes", lambda: NotesAndQuestionBankWidget(self.user, role="faculty")),
+            ("Notices and Reminders", lambda: NoticesAndRemindersWidget(self.user, role="faculty")),
+            ("AI Study Tutor", self._build_ai_rag_page),
+            ("Schedule / Timetable", self._build_timetable_page),
+            ("Voice Assistant", self._build_voice_page),
+            ("Voice Notes", lambda: VoiceNotesWidget(self.user)),
+            ("Online Exam Management", lambda: OnlineExamManagementWidget(self.user[0])),
+            ("Academic Structure", lambda: AcademicStructureWidget(self.user[0])),
+            ("Lab Manuals & Progress", lambda: LabManualsWidget(self.user[0])),
         )
-        for page in pages:
+        for page_name, build_page in page_builders:
+            try:
+                page = build_page()
+            except Exception as error:
+                # A failing feature module should not prevent faculty from
+                # opening the rest of the workspace. Keep its navigation slot
+                # visible and show the underlying error on that page.
+                page = QWidget()
+                error_layout = QVBoxLayout(page)
+                error_layout.setContentsMargins(28, 24, 28, 24)
+                error_layout.addWidget(create_section_header(page_name, "This section could not load."))
+                error_message = QLabel(str(error))
+                error_message.setWordWrap(True)
+                error_message.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                error_message.setStyleSheet("color: #8A3B32; padding: 12px; background: #FFF7F5; border: 1px solid #E8C9C4; border-radius: 6px;")
+                error_layout.addWidget(error_message)
+                error_layout.addStretch()
             self.stack.addWidget(create_content_scroll_area(page))
 
         main_layout.addWidget(sidebar)
@@ -395,7 +444,7 @@ class FacultyDashboard(QMainWindow):
         layout.addWidget(header)
         layout.addSpacing(16)
 
-        stats = get_dashboard_stats_faculty()
+        stats = get_dashboard_stats_faculty(self.user[0])
         attendance_value = (
             f"{stats['attendance_pct']}%" if stats["attendance_pct"] is not None else "—"
         )
@@ -406,7 +455,7 @@ class FacultyDashboard(QMainWindow):
 
         cards_layout = QHBoxLayout()
         cards_layout.setSpacing(14)
-        cards_layout.addWidget(self._create_card("Total Students", f"{stats['total_students']}", "Enrolled in CSE-C"))
+        cards_layout.addWidget(self._create_card("Total Students", f"{stats['total_students']}", "Across your assigned classes"))
         cards_layout.addWidget(self._create_card("Overall Attendance", attendance_value, attendance_caption, accent=True))
         cards_layout.addWidget(self._create_card("Published Assignments", f"{stats['total_assignments']}", "Active Course Work"))
         cards_layout.addWidget(self._create_card("Department Notices", f"{stats['total_notices']}", "Announcements Posted", primary=True))
@@ -618,13 +667,13 @@ class FacultyDashboard(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(24, 20, 24, 20)
 
-        layout.addWidget(create_section_header("AI Study Tutor & Local RAG Engine", "Search offline course documents, syllabi, and lab manuals"))
+        layout.addWidget(create_section_header("AI Study Tutor", "Find answers in course documents, syllabi, and lab manuals"))
         layout.addSpacing(12)
 
         self.rag_input = QLineEdit()
         self.rag_input.setPlaceholderText("Enter your question (e.g., 'Explain Unit 3', 'What is JVM?', 'What is Normalization?')...")
 
-        ask_btn = QPushButton("Search Local Knowledgebase")
+        ask_btn = QPushButton("Ask about Course Materials")
         ask_btn.setCursor(Qt.PointingHandCursor)
         ask_btn.setProperty("class", "secondary")
         ask_btn.clicked.connect(self._on_ask_rag)
@@ -652,9 +701,22 @@ class FacultyDashboard(QMainWindow):
     def _on_ask_rag(self):
         query = self.rag_input.text().strip()
         if not query:
+            self.rag_output.setPlainText("Enter a question about the uploaded course material or question bank.")
             return
-        res = rag_engine.query(query, role="faculty")
-        self.rag_output.setPlainText(f"Answer:\n{res['answer']}\n\n[Source: {res['source']} | Confidence: {res['confidence']}]")
+        try:
+            res = rag_engine.query(query, role="faculty", user_id=self.user[0])
+        except Exception as error:
+            self.rag_output.setPlainText(f"The local knowledge base could not be searched.\n\nDetails: {error}")
+            return
+        citations = res.get("citations", [])
+        source_text = "\n".join(
+            f"• {item['source']}" + (f" — page {item['page']}" if item.get("page") else "")
+            for item in citations
+        ) or res.get("source", "No source")
+        self.rag_output.setPlainText(
+            f"Answer from approved local material:\n{res['answer']}\n\n"
+            f"Sources:\n{source_text}\n\nConfidence: {res.get('confidence', 'Low')}"
+        )
 
     def _build_timetable_page(self) -> QWidget:
         page = QWidget()
@@ -666,8 +728,8 @@ class FacultyDashboard(QMainWindow):
         ))
         layout.addSpacing(12)
 
-        self.timetable_table = QTableWidget(0, 5)
-        self.timetable_table.setHorizontalHeaderLabels(["Day", "Start", "End", "Subject", "Room"])
+        self.timetable_table = QTableWidget(0, 6)
+        self.timetable_table.setHorizontalHeaderLabels(["Day", "Start", "End", "Subject", "Class", "Room"])
         self.timetable_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.timetable_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.timetable_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -676,9 +738,15 @@ class FacultyDashboard(QMainWindow):
         layout.addWidget(self.timetable_table, 1)
 
         form = QHBoxLayout()
+        self.timetable_class = QComboBox()
+        for class_row in get_academic_classes(faculty_id=self.user[0]):
+            self.timetable_class.addItem(
+                f"{class_row[1]} · Year {class_row[2]} · Section {class_row[3]} · {class_row[4]}",
+                class_row[0],
+            )
+        self.timetable_class.currentIndexChanged.connect(self._load_timetable_subjects)
         self.timetable_subject = QComboBox()
-        for subject_id, code, name in get_subjects():
-            self.timetable_subject.addItem(f"{code} — {name}", subject_id)
+        self._load_timetable_subjects()
         self.timetable_day = QComboBox()
         self.timetable_day.addItems(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])
         self.timetable_start = QTimeEdit(QTime(9, 0))
@@ -687,6 +755,7 @@ class FacultyDashboard(QMainWindow):
         self.timetable_end.setDisplayFormat("HH:mm")
         self.timetable_room = QLineEdit()
         self.timetable_room.setPlaceholderText("Room or lab")
+        form.addWidget(self.timetable_class, 2)
         form.addWidget(self.timetable_subject, 2)
         form.addWidget(self.timetable_day)
         form.addWidget(self.timetable_start)
@@ -715,10 +784,11 @@ class FacultyDashboard(QMainWindow):
         return page
 
     def _refresh_timetable(self):
-        self.timetable_rows = get_timetables()
+        self.timetable_rows = get_timetables(faculty_id=self.user[0])
         self.timetable_table.setRowCount(len(self.timetable_rows))
         for row, entry in enumerate(self.timetable_rows):
-            values = (entry[3], entry[4], entry[5], f"{entry[1]} — {entry[2]}", entry[6])
+            class_label = f"{entry[9]} · Year {entry[10]} · Section {entry[11]} · {entry[12]}" if entry[9] else "Unassigned"
+            values = (entry[3], entry[4], entry[5], f"{entry[1]} — {entry[2]}", class_label, entry[6])
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 if column == 0:
@@ -727,6 +797,19 @@ class FacultyDashboard(QMainWindow):
         self.timetable_update_button.setEnabled(False)
         self.timetable_delete_button.setEnabled(False)
         self.timetable_selected_id = None
+
+    def _load_timetable_subjects(self, *_):
+        if not hasattr(self, "timetable_subject"):
+            return
+        class_id = self.timetable_class.currentData()
+        selected = self.timetable_subject.currentData()
+        self.timetable_subject.clear()
+        if class_id is not None:
+            for subject_id, code, name in get_subjects(faculty_id=self.user[0], class_id=int(class_id)):
+                self.timetable_subject.addItem(f"{code} — {name}", subject_id)
+        index = self.timetable_subject.findData(selected)
+        if index >= 0:
+            self.timetable_subject.setCurrentIndex(index)
 
     def _select_timetable_entry(self):
         row = self.timetable_table.currentRow()
@@ -737,7 +820,11 @@ class FacultyDashboard(QMainWindow):
         if not entry:
             return
         self.timetable_selected_id = entry_id
-        subject_id = next((sid for sid, code, _ in get_subjects() if code == entry[1]), None)
+        class_index = self.timetable_class.findData(entry[8])
+        if class_index >= 0:
+            self.timetable_class.setCurrentIndex(class_index)
+        self._load_timetable_subjects()
+        subject_id = next((sid for sid, code, _ in get_subjects(faculty_id=self.user[0], class_id=entry[8]) if code == entry[1]), None)
         self.timetable_subject.setCurrentIndex(max(0, self.timetable_subject.findData(subject_id)))
         self.timetable_day.setCurrentText(entry[3])
         self.timetable_start.setTime(QTime.fromString(entry[4], "HH:mm"))
@@ -750,7 +837,7 @@ class FacultyDashboard(QMainWindow):
     def _timetable_form_values(self):
         return (self.timetable_subject.currentData(), self.timetable_day.currentText(),
                 self.timetable_start.time().toString("HH:mm"), self.timetable_end.time().toString("HH:mm"),
-                self.timetable_room.text().strip(), self.user[0])
+                self.timetable_room.text().strip(), self.user[0], self.timetable_class.currentData())
 
     def _add_timetable_entry(self):
         try:
@@ -786,11 +873,11 @@ class FacultyDashboard(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(24, 20, 24, 20)
 
-        layout.addWidget(create_section_header("Voice Command Console", "Type a command; app launches ask for confirmation"))
+        layout.addWidget(create_section_header("Voice Assistant", "Choose your microphone, check its level, then speak a short command and pause"))
         layout.addSpacing(12)
 
         self.voice_cmd_input = QLineEdit()
-        self.voice_cmd_input.setPlaceholderText("Type a command (e.g., 'open VS Code', 'read schedule', 'start timer for 5 minutes')")
+        self.voice_cmd_input.setPlaceholderText("Try: search for a file, find an app, or open VS Code")
 
         send_voice_btn = QPushButton("Execute Command")
         send_voice_btn.setCursor(Qt.PointingHandCursor)
@@ -798,8 +885,11 @@ class FacultyDashboard(QMainWindow):
 
         layout.addWidget(self.voice_cmd_input)
         layout.addWidget(send_voice_btn)
+        self.microphone_selector = MicrophoneSelector(self)
+        self.microphone_selector.device_combo.currentIndexChanged.connect(self._refresh_speech_device_status)
+        layout.addWidget(self.microphone_selector)
         microphone_row = QHBoxLayout()
-        speech_ready, speech_message = speech_input_status()
+        speech_ready, speech_message = speech_input_status(self.microphone_selector.selected_device)
         self.speech_status_label = QLabel(speech_message)
         self.speech_status_label.setWordWrap(True)
         self.speech_status_label.setStyleSheet("color: #687782; font-size: 12px;")
@@ -874,6 +964,12 @@ class FacultyDashboard(QMainWindow):
             res = intent["reply"]
         elif intent.get("intent") == "start_timer":
             res = intent.get("reply", "The timer could not be started.")
+        elif intent.get("intent") == "open_course_material":
+            from gui.voice_actions import open_course_material
+            res = open_course_material(self, intent.get("query", ""))
+        elif intent.get("intent") == "search_local_item":
+            from gui.voice_actions import search_local_item
+            res = search_local_item(self, intent.get("query", ""), intent.get("kind", "all"))
         elif intent.get("intent") in {"run_python", "compile_java", "create_project"}:
             res = "Code Runner is available from the student workspace only."
         else:
@@ -884,7 +980,7 @@ class FacultyDashboard(QMainWindow):
     def _start_speech_input(self):
         if self.speech_worker and self.speech_worker.isRunning():
             return
-        ready, explanation = speech_input_status()
+        ready, explanation = speech_input_status(self.microphone_selector.selected_device)
         if not ready:
             self.speech_status_label.setText(explanation)
             return
@@ -893,11 +989,26 @@ class FacultyDashboard(QMainWindow):
         self.speech_status_label.setText("Listening offline… say a command, then pause.")
         self.speech_start_button.setEnabled(False)
         self.speech_stop_button.setEnabled(True)
-        self.speech_worker = SpeechInputWorker(self, command_mode=True)
+        self.microphone_selector.set_level(0)
+        self.speech_worker = SpeechInputWorker(
+            self, command_mode=True, input_device=self.microphone_selector.selected_device
+        )
+        self.speech_worker.partial_text.connect(self._show_speech_partial)
+        self.speech_worker.audio_level.connect(self.microphone_selector.set_level)
         self.speech_worker.phrase_recognized.connect(self._process_spoken_command)
         self.speech_worker.failed.connect(self._speech_input_failed)
         self.speech_worker.finished.connect(self._speech_input_finished)
         self.speech_worker.start()
+
+    def _show_speech_partial(self, phrase: str):
+        if phrase:
+            self.voice_cmd_input.setText(phrase)
+            self.speech_status_label.setText(f"Hearing: “{phrase}”…")
+
+    def _refresh_speech_device_status(self):
+        ready, message = speech_input_status(self.microphone_selector.selected_device)
+        self.speech_status_label.setText(message)
+        self.speech_start_button.setEnabled(ready and not (self.speech_worker and self.speech_worker.isRunning()))
 
     def _process_spoken_command(self, phrase: str):
         self.last_spoken_phrase = phrase
@@ -916,9 +1027,10 @@ class FacultyDashboard(QMainWindow):
         self.speech_error = message
 
     def _speech_input_finished(self):
-        ready, explanation = speech_input_status()
+        ready, explanation = speech_input_status(self.microphone_selector.selected_device)
         self.speech_start_button.setEnabled(ready)
         self.speech_stop_button.setEnabled(False)
+        self.microphone_selector.set_level(0)
         if self.last_spoken_phrase and not self.speech_error:
             self.speech_status_label.setText("Review the recognized text and select Execute Command.")
         else:

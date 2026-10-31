@@ -4,6 +4,15 @@ Allows students or faculty to mark attendance by speaking roll numbers.
 """
 import re
 
+_NUMBER_WORDS = {
+    "zero": 0, "oh": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19, "twenty": 20,
+}
+_NUMBER_ALTERNATIVES = "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True))
+
 
 def parse_roll_call_response(spoken_text: str) -> str | None:
     """Return a single explicit present/absent response, or None when unclear."""
@@ -23,9 +32,9 @@ def parse_voice_attendance_phrase(spoken_text: str, students=None) -> list:
     results = {}
     text = spoken_text.lower()
 
-    # Pattern for roll numbers (e.g., 'roll 1 present', 'roll number 2 absent', '23cse003 present')
+    # Accept both digits and spoken number words for convenient roll calls.
     patterns = [
-        r"(?:roll(?:\s+number)?|student)\s*#?\s*(\d+)\s*(present|absent)",
+        rf"(?:roll(?:\s+number)?|student)\s*#?\s*(\d+|{_NUMBER_ALTERNATIVES})\s*(present|absent)",
         r"([0-9]{2}cse[0-9]{3})\s*(present|absent)"
     ]
 
@@ -35,10 +44,11 @@ def parse_voice_attendance_phrase(spoken_text: str, students=None) -> list:
             if "CSE" in num.upper():
                 roll = num.upper()
             else:
+                numeric_roll = int(num) if num.isdigit() else _NUMBER_WORDS[num.casefold()]
                 roster_match = next((str(row[1]).upper() for row in (students or [])
                                      if re.search(r"(\d+)$", str(row[1]))
-                                     and int(re.search(r"(\d+)$", str(row[1])).group(1)) == int(num)), None)
-                roll = roster_match or f"23CSE{int(num):03d}"
+                                     and int(re.search(r"(\d+)$", str(row[1])).group(1)) == numeric_roll), None)
+                roll = roster_match or f"23CSE{numeric_roll:03d}"
             parsed = "Present" if status.lower() == "present" else "Absent"
             if roll in results and results[roll] != parsed:
                 raise ValueError(f"Conflicting attendance statuses were given for {roll}.")

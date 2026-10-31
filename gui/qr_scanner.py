@@ -72,7 +72,7 @@ class AttendanceQRScannerDialog(QDialog):
             self.status.setText("Point the camera at the faculty's current EduPilot QR code.")
             self._timer.start()
         except ImportError:
-            self.status.setText("Camera scanning needs OpenCV. You can cancel and paste the faculty's signed code instead.")
+            self.status.setText("Camera scanning is unavailable. Cancel and paste the faculty's current signed code instead.")
         except Exception as error:
             self._release_camera()
             self.status.setText(f"Could not start the camera: {error}")

@@ -23,6 +23,7 @@ ENV/
 # Temporary files & artifacts
 tmp/
 *.zip
+edupilot-material-*/
 
 # Generated presentation renders and local review deck exports
 .presentation-build/

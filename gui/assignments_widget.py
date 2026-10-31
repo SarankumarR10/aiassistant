@@ -9,6 +9,7 @@ from datetime import date
 from database.database import (
     get_subjects,
     get_assignments,
+    get_academic_classes,
     add_assignment,
     get_assignment_submissions,
     get_student_assignment_submission,
@@ -26,7 +27,8 @@ class AssignmentsWidget(QWidget):
         super().__init__()
         self.user = user
         self.role = role
-        self.subjects = get_subjects()
+        self.classes = get_academic_classes(faculty_id=user[0]) if role == "faculty" else []
+        self.subjects = get_subjects(faculty_id=user[0]) if role == "faculty" else get_subjects(student_user_id=user[0])
         self.init_ui()
 
     def init_ui(self):
@@ -53,8 +55,8 @@ class AssignmentsWidget(QWidget):
         left_layout.addWidget(list_lbl)
 
         self.table_assignments = QTableWidget()
-        self.table_assignments.setColumnCount(4)
-        self.table_assignments.setHorizontalHeaderLabels(["ID", "Subject", "Assignment Title", "Due Date"])
+        self.table_assignments.setColumnCount(5)
+        self.table_assignments.setHorizontalHeaderLabels(["ID", "Subject", "Class", "Assignment Title", "Due Date"])
         self.table_assignments.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_assignments.itemSelectionChanged.connect(self._on_assignment_selected)
         left_layout.addWidget(self.table_assignments)
@@ -76,9 +78,15 @@ class AssignmentsWidget(QWidget):
             form_lbl.setStyleSheet("font-size: 13px; font-weight: 700; color: #0F172A;")
             fc_layout.addWidget(form_lbl)
 
+            self.combo_class = QComboBox()
+            for class_row in self.classes:
+                self.combo_class.addItem(
+                    f"{class_row[1]} · Year {class_row[2]} · Section {class_row[3]} · {class_row[4]}",
+                    class_row[0],
+                )
+            self.combo_class.currentIndexChanged.connect(self._load_class_subjects)
             self.combo_subject = QComboBox()
-            for s in self.subjects:
-                self.combo_subject.addItem(f"{s[1]} - {s[2]}", s[0])
+            self._load_class_subjects()
             
             self.input_title = QLineEdit()
             self.input_title.setPlaceholderText("Assignment Title...")
@@ -95,6 +103,7 @@ class AssignmentsWidget(QWidget):
             btn_create.setProperty("class", "secondary")
             btn_create.clicked.connect(self._create_assignment)
 
+            fc_layout.addWidget(self.combo_class)
             fc_layout.addWidget(self.combo_subject)
             fc_layout.addWidget(self.input_title)
             fc_layout.addWidget(self.input_due)
@@ -219,14 +228,29 @@ class AssignmentsWidget(QWidget):
         self._load_assignments()
 
     def _load_assignments(self):
-        assignments = get_assignments()
+        if self.role == "faculty":
+            assignments = get_assignments(faculty_id=self.user[0], class_id=self.combo_class.currentData())
+        else:
+            assignments = get_assignments(student_user_id=self.user[0])
         self.current_assignments = assignments
         self.table_assignments.setRowCount(len(assignments))
         for row, a in enumerate(assignments):
             self.table_assignments.setItem(row, 0, QTableWidgetItem(str(a[0])))
             self.table_assignments.setItem(row, 1, QTableWidgetItem(f"{a[1]} - {a[2]}"))
-            self.table_assignments.setItem(row, 2, QTableWidgetItem(str(a[3])))
-            self.table_assignments.setItem(row, 3, QTableWidgetItem(str(a[5])))
+            class_label = f"{a[8]} · Year {a[9]} · Section {a[10]} · {a[11]}" if a[8] else "General"
+            self.table_assignments.setItem(row, 2, QTableWidgetItem(class_label))
+            self.table_assignments.setItem(row, 3, QTableWidgetItem(str(a[3])))
+            self.table_assignments.setItem(row, 4, QTableWidgetItem(str(a[5])))
+
+    def _load_class_subjects(self, *_):
+        if self.role != "faculty" or not hasattr(self, "combo_subject"):
+            return
+        class_id = self.combo_class.currentData()
+        self.combo_subject.clear()
+        if class_id is None:
+            return
+        for subject in get_subjects(faculty_id=self.user[0], class_id=int(class_id)):
+            self.combo_subject.addItem(f"{subject[1]} - {subject[2]}", subject[0])
 
     def _create_assignment(self):
         subject_id = self.combo_subject.currentData()
@@ -245,7 +269,8 @@ class AssignmentsWidget(QWidget):
             return
 
         try:
-            add_assignment(subject_id, title, desc, due_date, faculty_id=self.user[0])
+            add_assignment(subject_id, title, desc, due_date, faculty_id=self.user[0],
+                           class_id=self.combo_class.currentData())
         except Exception as exc:
             QMessageBox.critical(self, "Could not publish assignment", str(exc))
             return

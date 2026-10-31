@@ -1,7 +1,7 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QGridLayout, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QFrame
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QGridLayout, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QComboBox, QHBoxLayout
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
-from database.database import get_attendance_analytics, get_classroom_activity_stats
+from database.database import get_academic_classes, get_attendance_analytics, get_classroom_activity_stats
 from gui.theme import POSITIVUS_QSS, create_section_header
 
 
@@ -18,6 +18,18 @@ class ClassroomAnalyticsWidget(QWidget):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(16)
         layout.addWidget(create_section_header("Classroom & Academic Analytics"))
+        class_row = QHBoxLayout()
+        class_row.addWidget(QLabel("Academic class:"))
+        self.class_filter = QComboBox()
+        self.class_filter.addItem("All my classes", None)
+        self.classes = get_academic_classes(faculty_id=self.faculty_id)
+        for item in self.classes:
+            self.class_filter.addItem(
+                f"{item[1]} · Year {item[2]} · Section {item[3]} · {item[4]}", item[0]
+            )
+        self.class_filter.currentIndexChanged.connect(self.load_analytics_data)
+        class_row.addWidget(self.class_filter, 1)
+        layout.addLayout(class_row)
         kpis = QGridLayout()
         kpis.setHorizontalSpacing(12)
         kpis.setVerticalSpacing(12)
@@ -56,8 +68,9 @@ class ClassroomAnalyticsWidget(QWidget):
         self.load_analytics_data()
 
     def load_analytics_data(self):
-        rows = get_attendance_analytics()
-        activity = get_classroom_activity_stats(self.faculty_id)
+        class_id = self.class_filter.currentData()
+        rows = get_attendance_analytics(class_id=class_id, faculty_id=self.faculty_id)
+        activity = get_classroom_activity_stats(self.faculty_id, class_id=class_id)
         measured = [row[4] for row in rows if row[2] > 0]
         values = [f"{sum(measured) / len(measured):.1f}%" if measured else "—",
                   str(sum(pct < 75 for pct in measured)) if measured else "—",

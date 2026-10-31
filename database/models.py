@@ -17,6 +17,30 @@ class Student:
     department: str
     year: int
     section: str = "C"
+    class_id: Optional[int] = None
+
+@dataclass
+class AcademicClass:
+    id: int
+    department: str
+    year_of_study: int
+    section: str
+    academic_year: str
+
+@dataclass
+class FacultyProfile:
+    user_id: int
+    employee_code: Optional[str]
+    department: str
+    designation: str
+
+@dataclass
+class TeachingAssignment:
+    id: int
+    class_id: int
+    subject_id: int
+    faculty_id: int
+    academic_term: str = "Full Year"
 
 @dataclass
 class Subject:

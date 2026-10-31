@@ -19,8 +19,12 @@ from PySide6.QtCore import QDate, Qt
 from database.database import (
     get_students,
     get_subjects,
+    get_academic_classes,
     save_attendance,
-    get_attendance_session_records
+    get_attendance_session_records,
+    get_student_face_enrollment_status,
+    get_student_face_enrollments,
+    delete_student_face_enrollment,
 )
 from reports.report_generator import report_generator
 from gui.theme import POSITIVUS_QSS, create_section_header
@@ -75,7 +79,7 @@ class AttendanceWindow(QWidget):
         self.subject_combo = QComboBox()
         self.subject_combo.setMinimumWidth(320)
 
-        section_label = QLabel("Section:")
+        section_label = QLabel("Academic class:")
         self.section_combo = QComboBox()
 
         date_label = QLabel("Date:")
@@ -110,10 +114,11 @@ class AttendanceWindow(QWidget):
         mark_absent.setProperty("class", "outline")
         mark_absent.clicked.connect(self.mark_all_absent)
 
-        face_btn = QPushButton("Face attendance unavailable")
+        face_btn = QPushButton("Face verification setup")
         face_btn.setCursor(Qt.PointingHandCursor)
-        face_btn.setEnabled(False)
-        face_btn.setToolTip("Face detection cannot verify a student's identity. Use manual or QR attendance.")
+        face_btn.setProperty("class", "outline")
+        face_btn.setToolTip("Students must opt in and complete face enrollment before face matching is available.")
+        face_btn.clicked.connect(self.start_face_attendance)
 
         qr_btn = QPushButton("Generate QR Attendance")
         qr_btn.setCursor(Qt.PointingHandCursor)
@@ -173,11 +178,13 @@ class AttendanceWindow(QWidget):
 
         # ATTENDANCE TABLE
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
+        self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels([
             "Roll Number",
             "Student Name",
             "Status",
+            "Marked via",
+            "Face enrollment",
             "Action"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -191,22 +198,31 @@ class AttendanceWindow(QWidget):
 
     def load_data(self):
         all_students = get_students(faculty_id=self.faculty_id)
-        subjects = get_subjects()
+        self.classes = get_academic_classes(faculty_id=self.faculty_id)
 
         self.section_combo.blockSignals(True)
         self.section_combo.clear()
-        self.section_combo.addItems(sorted({str(student[5]) for student in all_students}))
+        for class_row in self.classes:
+            self.section_combo.addItem(
+                f"{class_row[1]} · Year {class_row[2]} · Section {class_row[3]} · {class_row[4]}",
+                class_row[0],
+            )
         self.section_combo.blockSignals(False)
-
-        self.subject_combo.clear()
-        for subject_id, code, name in subjects:
-            self.subject_combo.addItem(f"{code} - {name}", subject_id)
 
         self._load_section_students()
 
     def _load_section_students(self, *_):
-        section = self.section_combo.currentText()
-        self.students = get_students(section, faculty_id=self.faculty_id) if section else []
+        class_id = self.section_combo.currentData()
+        class_row = next((row for row in getattr(self, "classes", []) if row[0] == class_id), None)
+        section = class_row[3] if class_row else ""
+        self.subject_combo.blockSignals(True)
+        self.subject_combo.clear()
+        if class_id is not None:
+            for subject_id, code, name in get_subjects(faculty_id=self.faculty_id, class_id=int(class_id)):
+                self.subject_combo.addItem(f"{code} - {name}", subject_id)
+        self.subject_combo.blockSignals(False)
+        self.students = get_students(faculty_id=self.faculty_id, class_id=int(class_id)) if class_id is not None else []
+        self.face_enrollment_status = get_student_face_enrollment_status(section, self.faculty_id, int(class_id)) if class_id is not None else {}
         self.table.setRowCount(len(self.students))
         self.statuses.clear()
         self.verification_methods.clear()
@@ -223,13 +239,17 @@ class AttendanceWindow(QWidget):
 
             status_item = QTableWidgetItem("Unmarked")
             self.table.setItem(row, 2, status_item)
+            self.table.setItem(row, 3, QTableWidgetItem("—"))
+            expiry = self.face_enrollment_status.get(student_id)
+            face_status = f"Enrolled until {expiry[:10]}" if expiry else "Not enrolled"
+            self.table.setItem(row, 4, QTableWidgetItem(face_status))
 
             toggle = QPushButton("Toggle")
             toggle.setCursor(Qt.PointingHandCursor)
             toggle.setProperty("class", "outline")
             toggle.clicked.connect(lambda checked=False, sid=student_id, r=row: self.toggle_status(sid, r))
 
-            self.table.setCellWidget(row, 3, toggle)
+            self.table.setCellWidget(row, 5, toggle)
         self._load_existing_attendance()
 
     def _load_existing_attendance(self, *_):
@@ -238,7 +258,10 @@ class AttendanceWindow(QWidget):
             return
         qdate = self.date_edit.date()
         date_str = f"{qdate.year():04d}-{qdate.month():02d}-{qdate.day():02d}"
-        existing = get_attendance_session_records(subject_id, date_str, self.section_combo.currentText())
+        class_id = self.section_combo.currentData()
+        class_row = next((row for row in getattr(self, "classes", []) if row[0] == class_id), None)
+        section = class_row[3] if class_row else ""
+        existing = get_attendance_session_records(subject_id, date_str, section, class_id=int(class_id) if class_id is not None else None)
         for row, student in enumerate(self.students):
             student_id = student[0]
             saved = existing.get(student_id)
@@ -248,6 +271,9 @@ class AttendanceWindow(QWidget):
             item = self.table.item(row, 2)
             if item:
                 item.setText(status)
+            method_item = self.table.item(row, 3)
+            if method_item:
+                method_item.setText(method.title() if saved else "—")
 
     def toggle_status(self, student_id, row):
         current = self.statuses.get(student_id, "Unmarked")
@@ -257,6 +283,9 @@ class AttendanceWindow(QWidget):
         item = self.table.item(row, 2)
         if item:
             item.setText(new_status)
+        method_item = self.table.item(row, 3)
+        if method_item:
+            method_item.setText("Manual")
 
     def mark_all_present(self):
         for row, student in enumerate(self.students):
@@ -266,6 +295,9 @@ class AttendanceWindow(QWidget):
             item = self.table.item(row, 2)
             if item:
                 item.setText("Present")
+            method_item = self.table.item(row, 3)
+            if method_item:
+                method_item.setText("Manual")
 
     def mark_all_absent(self):
         for row, student in enumerate(self.students):
@@ -275,6 +307,9 @@ class AttendanceWindow(QWidget):
             item = self.table.item(row, 2)
             if item:
                 item.setText("Absent")
+            method_item = self.table.item(row, 3)
+            if method_item:
+                method_item.setText("Manual")
 
     def save(self):
         subject_id = self.subject_combo.currentData()
@@ -295,9 +330,10 @@ class AttendanceWindow(QWidget):
                 subject_id=subject_id,
                 attendance_date=date_str,
                 faculty_id=self.faculty_id,
-                section=self.section_combo.currentText(),
+                section=next((item[3] for item in self.classes if item[0] == self.section_combo.currentData()), ""),
+                class_id=self.section_combo.currentData(),
             )
-            QMessageBox.information(self, "Attendance", "Attendance recorded successfully into database.")
+            QMessageBox.information(self, "Attendance", "Attendance recorded successfully.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save attendance: {e}")
 
@@ -355,17 +391,99 @@ class AttendanceWindow(QWidget):
             "subject_id": self.subject_combo.currentData(),
             "start_date": start_date.isoformat() if start_date else None,
             "end_date": end_date.isoformat() if end_date else None,
-            "section": self.section_combo.currentText() or None,
+            "class_id": self.section_combo.currentData(),
         }
 
     def start_face_attendance(self):
-        QMessageBox.information(self, "Face attendance unavailable",
-            "Face detection is not identity verification. Face attendance will be enabled after consented student enrollment and identity matching are implemented.")
+        from attendance.face_attendance import FaceAttendanceSystem, FaceRecognitionUnavailable
+        from gui.face_attendance import FaceEnrollmentDialog, FaceRecognitionDialog
+
+        try:
+            recognizer = FaceAttendanceSystem()
+        except FaceRecognitionUnavailable as error:
+            QMessageBox.information(self, "Face matching needs setup", str(error))
+            return
+
+        chooser = QMessageBox(self)
+        chooser.setWindowTitle("Opt-in face attendance")
+        chooser.setText(
+            "Enroll an opted-in student, match a face to this section, or remove a saved enrollment. "
+            "A match is only a suggestion and requires faculty confirmation."
+        )
+        enroll_action = chooser.addButton("Enroll selected student", QMessageBox.ActionRole)
+        match_action = chooser.addButton("Recognize face", QMessageBox.ActionRole)
+        remove_action = chooser.addButton("Remove enrollment", QMessageBox.ActionRole)
+        chooser.addButton(QMessageBox.Cancel)
+        chooser.exec()
+        action = chooser.clickedButton()
+
+        row = self.table.currentRow()
+        student = self.students[row] if 0 <= row < len(self.students) else None
+        if action in (enroll_action, remove_action) and not student:
+            QMessageBox.information(self, "Select a student", "Select a student row in the attendance register first.")
+            return
+
+        if action == enroll_action:
+            try:
+                dialog = FaceEnrollmentDialog(student[0], student[2], self.faculty_id, self)
+                if dialog.exec():
+                    self._load_section_students()
+                    QMessageBox.information(self, "Enrollment saved", "Encrypted samples were saved on this device for 90 days.")
+            except Exception as error:
+                QMessageBox.critical(self, "Could not enroll face", str(error))
+            return
+
+        if action == remove_action:
+            answer = QMessageBox.question(
+                self, "Remove face enrollment",
+                f"Delete the device-local face samples for {student[2]}?",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+            )
+            if answer == QMessageBox.Yes:
+                try:
+                    removed = delete_student_face_enrollment(student[0], self.faculty_id)
+                    if removed:
+                        self._load_section_students()
+                    else:
+                        QMessageBox.information(self, "No enrollment", "This student has no face enrollment on this device.")
+                except Exception as error:
+                    QMessageBox.critical(self, "Could not remove enrollment", str(error))
+            return
+
+        if action != match_action:
+            return
+        try:
+            class_id = self.section_combo.currentData()
+            section = next((item[3] for item in self.classes if item[0] == class_id), "")
+            enrollments = get_student_face_enrollments(section, self.faculty_id, class_id)
+            if not enrollments:
+                QMessageBox.information(
+                    self, "No enrolled faces",
+                    "No active face enrollments exist for this section on this device. Enroll opted-in students first.",
+                )
+                return
+            count = recognizer.train(enrollments)
+            dialog = FaceRecognitionDialog(recognizer, self.students, self)
+            if dialog.exec() and dialog.candidate_id is not None:
+                student_id = dialog.candidate_id
+                if self.statuses.get(student_id) == "Present":
+                    QMessageBox.information(self, "Already present", "This student is already marked Present.")
+                    return
+                row = next(index for index, item in enumerate(self.students) if item[0] == student_id)
+                self.statuses[student_id] = "Present"
+                self.verification_methods[student_id] = "face"
+                self.table.item(row, 2).setText("Present")
+                self.table.item(row, 3).setText("Face — confirmed")
+                QMessageBox.information(self, "Attendance updated", "The confirmed face match is marked Present. Save the register to record it.")
+        except Exception as error:
+            QMessageBox.critical(self, "Face recognition failed", str(error))
 
     def start_qr_attendance(self):
         from attendance.qr_attendance import QRAttendanceSystem
         from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QApplication
         from PySide6.QtGui import QPixmap
+        from PySide6.QtCore import QTimer
+        import time
 
         subject_id = self.subject_combo.currentData()
         if not subject_id:
@@ -376,7 +494,9 @@ class AttendanceWindow(QWidget):
 
         try:
             qr_sys = QRAttendanceSystem()
-            token = qr_sys.generate_token(subject_id, date_str, self.faculty_id, self.section_combo.currentText())
+            class_id = self.section_combo.currentData()
+            section = next((item[3] for item in self.classes if item[0] == class_id), "")
+            token = qr_sys.generate_token(subject_id, date_str, self.faculty_id, section, class_id=class_id)
         except Exception as error:
             QMessageBox.warning(self, "QR attendance", str(error))
             return
@@ -409,7 +529,7 @@ class AttendanceWindow(QWidget):
             if not qr_image.loadFromData(image_bytes.getvalue(), "PNG"):
                 raise RuntimeError("Qt could not read the generated QR image.")
             qr_label.setPixmap(qr_image.scaled(228, 228, Qt.KeepAspectRatio, Qt.FastTransformation))
-            qr_status.setText("Ready to scan. This QR code expires in 5 minutes.")
+            qr_status.setText("Scannable attendance QR is ready.")
         except Exception as error:
             qr_label.setText("QR image unavailable")
             qr_status.setText(
@@ -418,6 +538,10 @@ class AttendanceWindow(QWidget):
                 f"Details: {error}"
             )
         d_layout.addWidget(qr_status)
+
+        expiry_label = QLabel()
+        expiry_label.setStyleSheet("font-weight: 600; color: #26323B;")
+        d_layout.addWidget(expiry_label)
 
         lbl_token_title = QLabel("Manual check-in code")
         lbl_token_title.setStyleSheet("font-weight: 600; color: #26323B; margin-top: 2px;")
@@ -440,6 +564,27 @@ class AttendanceWindow(QWidget):
         btn_close = QPushButton("Close QR Session")
         btn_close.clicked.connect(dialog.accept)
         d_layout.addWidget(btn_close)
+
+        expires_at = int(token.split(":")[3])
+        expiry_timer = QTimer(dialog)
+        expiry_timer.setInterval(1000)
+
+        def update_expiry():
+            remaining = max(0, expires_at - int(time.time()))
+            if remaining:
+                minutes, seconds = divmod(remaining, 60)
+                expiry_label.setText(f"Check-in code expires in {minutes:02d}:{seconds:02d}.")
+                return
+            expiry_timer.stop()
+            expiry_label.setText("This check-in code has expired. Close this window and generate a new one.")
+            qr_label.clear()
+            qr_label.setText("QR code expired")
+            copy_button.setEnabled(False)
+
+        expiry_timer.timeout.connect(update_expiry)
+        expiry_timer.start()
+        update_expiry()
+        dialog.finished.connect(expiry_timer.stop)
 
         dialog.exec()
 
@@ -550,6 +695,9 @@ class AttendanceWindow(QWidget):
             status_item = self.table.item(row, 2)
             if status_item:
                 status_item.setText(status)
+            method_item = self.table.item(row, 3)
+            if method_item:
+                method_item.setText("Voice")
             roll_call_position[0] += 1
             QTimer.singleShot(250, call_next_student)
 
@@ -571,6 +719,18 @@ class AttendanceWindow(QWidget):
                 if roll_call_active[0]:
                     finish_roll_call("Microphone stopped before roll call finished. Completed responses are kept.")
 
+        def show_partial_transcript(text):
+            if text:
+                mic_status.setText(f"Listening: {text}")
+
+        def show_recognized_phrase(text):
+            if roll_call_active[0]:
+                input_voice.setText(text)
+            else:
+                previous = input_voice.text().strip()
+                input_voice.setText(f"{previous}, {text}" if previous else text)
+                mic_status.setText("Recognized. Review the text, then process attendance.")
+
         def start_mic():
             if active_worker[0] and active_worker[0].isRunning():
                 return False
@@ -579,7 +739,8 @@ class AttendanceWindow(QWidget):
                 mic_status.setText(explanation)
                 return False
             worker = SpeechInputWorker(dialog)
-            worker.phrase_recognized.connect(input_voice.setText)
+            worker.phrase_recognized.connect(show_recognized_phrase)
+            worker.partial_text.connect(show_partial_transcript)
             worker.failed.connect(mic_status.setText)
             active_worker[0] = worker
             mic_status.setText("Listening offline; pause after speaking.")
@@ -664,6 +825,9 @@ class AttendanceWindow(QWidget):
                             item_t = self.table.item(row, 2)
                             if item_t:
                                 item_t.setText(status)
+                            method_item = self.table.item(row, 3)
+                            if method_item:
+                                method_item.setText("Voice")
                             count += 1
                     if not any(student[1].upper() == roll for student in self.students):
                         unmatched.append(roll)

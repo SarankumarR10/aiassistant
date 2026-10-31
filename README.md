@@ -2,7 +2,7 @@
 
 EduPilot is a local-first desktop application for faculty and students. It includes attendance, assignments, student records, local course-material search, and lab workflows. The student workspace includes a restricted code runner; faculty no longer see that tool. The app uses **PySide6 (Qt for Python)**, SQLite for device-local data, and optional PostgreSQL for shared academic records.
 
-The application has database-backed faculty and student workflows. Microphone speech recognition needs a separately installed Vosk model. Face attendance remains disabled until consented enrollment and identity matching are implemented.
+The application has database-backed faculty and student workflows. Microphone speech recognition needs a separately installed Vosk model. Optional face attendance uses opt-in, device-local encrypted enrollment and faculty-confirmed matches; it does not perform liveness detection.
 
 EduPilot uses a split data store. PostgreSQL holds shared academic records and accounts when configured; SQLite keeps private device-only data such as voice notes and local settings. The QR attendance signing key is shared through PostgreSQL when that database is configured, so connected faculty and student devices validate the same QR token. Without PostgreSQL configured, the app uses SQLite for the whole database. PostgreSQL access is currently a direct connection for a controlled classroom/demo network; do not expose it to the public internet. A production product should put an authenticated API between desktop clients and PostgreSQL. Uploaded files remain local to the device, and offline AI/course-material search stays on the device.
 
@@ -10,7 +10,7 @@ EduPilot uses a split data store. PostgreSQL holds shared academic records and a
 
 ## 🚀 Quick Start for Team Members
 
-Install Python 3.10 or newer, then set up and start the project. Run these scripts from the `aiassistant` folder.
+Install Python 3.10 or newer, download/clone the repository, and open the `aiassistant` project folder. The scripts below switch to their own folder automatically, so you can launch them from any working directory.
 
 ### Option 1: One-Click Automated Setup (Recommended)
 
@@ -57,7 +57,7 @@ python main.py
 
 ### Optional offline speech features
 
-The microphone requires the optional packages and a separately downloaded Vosk English model. From the `aiassistant` folder, run `pip install -r requirements-optional.txt`, then place the extracted model in `models/vosk-model-small-en-us-0.15`. Text commands and the rest of the app do not require this setup.
+The microphone requires the optional packages and a separately downloaded Vosk English model. From the `aiassistant` folder, run `pip install -r requirements-optional.txt`, then place the extracted model in `models/vosk-model-small-en-us-0.15`. Face matching also needs a webcam and student opt-in enrollment on that computer. Installing `opencv-contrib-python` replaces `opencv-python` because both packages provide the `cv2` module. Text commands and the rest of the app do not require these optional features.
 
 ### Optional student code runner
 
@@ -72,6 +72,8 @@ The runner has no network, a read-only base filesystem, a temporary per-run work
 Practical exams open in fullscreen after the student confirms. The app keeps the exam timer running, autosaves a private draft, submits the last answer when time expires, and prevents normal in-app navigation or closing until submission or timeout. This is an app-level exam mode; Windows shortcuts and administrator tools can still switch away or stop the app, so it is not a managed-device kiosk or remote proctoring system.
 
 ### Connect to PostgreSQL
+
+PostgreSQL is optional for a single-computer demo. A fresh install uses SQLite automatically; your friend can skip this section. Configure PostgreSQL only when the app should share academic records between computers on a trusted network.
 
 Install PostgreSQL, start the server, then run the setup wizard from the project folder:
 
@@ -105,24 +107,36 @@ Replace the example share with the actual shared folder. Each computer must use 
 
 ## 🔑 Default Login Credentials
 
-The project comes pre-seeded with test accounts for Faculty and Student roles:
+On a fresh local SQLite database, EduPilot creates the demonstration accounts below. If you use a PostgreSQL database, the accounts are created there on first initialization too. These are public demo passwords; change them before entering real student information.
 
 | Role | Username | Password | Access Level |
 | :--- | :--- | :--- | :--- |
-| **Faculty** | `faculty` | `faculty123` | Full Admin Dashboard, Attendance Taker, Analytics, Lab Exam Control, Question Bank, Notices |
-| **Student** | `student` | `student123` | Student Dashboard, Personal Academics, Attendance Report, Code Runner, AI Tutor |
-| **Student 2** | `student2` | `student123` | Student View for Bala Kumar |
-| **Student 3** | `student3` | `student123` | Student View for Dinesh Raj |
+| **Faculty** | `faculty1` | `Faculty123!` | Faculty dashboard and teaching modules |
+| **Faculty** | `faculty2` | `Faculty123!` | Faculty dashboard and teaching modules |
+| **Faculty** | `faculty3` | `Faculty123!` | Faculty dashboard and teaching modules |
+| **Student** | `student1` | `Student123!` | Student dashboard |
+| **Student** | `student2` | `Student123!` | Student dashboard |
+| **Student** | `student3` | `Student123!` | Student dashboard |
+
+The demo accounts and class data are listed in [Demo Accounts](docs/DEMO_ACCOUNTS.md). The one-time demo reset applies when updating an existing database: it clears old academic records and managed uploads. Back up any data you need before first launching this version against an existing EduPilot database. A friend with a fresh install starts with a new database and demo data.
 
 ---
 
 ## 📦 Installed Packages & Dependencies
 
-`requirements.txt` installs the core desktop app and its supported features: PySide6, QR image creation, Excel exports, PDF text extraction, and workstation metrics. `requirements-optional.txt` is only for local speech recognition, speech output, and camera-based tools. The Vosk model and Docker runner image are separate downloads; neither is bundled with the source.
+`requirements.txt` installs the core desktop app and its supported features: PySide6, QR image creation, Excel exports, PDF text extraction, and workstation metrics. `requirements-optional.txt` installs local speech recognition, speech output, camera scanning, and face matching tools. The Vosk model and Docker runner image are separate downloads; neither is bundled with the source.
+
+### Local AI tutor and RAG search
+
+Faculty add UTF-8 `.txt`/`.md` files or text-based `.pdf` course material from **Knowledge Base and Notes**. EduPilot extracts the text, splits it into overlapping passages, and searches them locally with BM25 ranking. The tutor returns relevant passages with the document title and PDF page where available. It also searches the local FAQs and question bank. No course content is sent to a cloud service and no generative language model is bundled; answers are limited to the material EduPilot can retrieve. Scanned PDFs need OCR before upload because image-only pages have no searchable text. Faculty can select and delete a document to remove its index, then upload the corrected file.
+
+### Student, class, subject, and faculty structure
+
+Faculty can organize cohorts by department/program, year of study, section, and academic year in **Academic Structure**. Add each student to the exact class, save staff IDs and faculty departments, then assign subjects to a class and faculty member. Attendance, marks, assignments, course notes, question banks, schedules, notices, RAG search, analytics, and online exams are filtered using those class assignments. Existing student groups are migrated from their saved department/year/section; old course records are linked only when the correct class is unambiguous. If a legacy record cannot be assigned safely, faculty can attach it to the right class through the relevant module.
 
 ### Data and file storage
 
-Shared academic records are stored in PostgreSQL when configured. Private voice notes and device-local application settings are stored in SQLite. Uploaded course documents and assignment attachments are copied into the managed files folder; the database stores file keys and metadata rather than file contents. By default, the files folder is local, but `EDUPILOT_FILES_DIR` can point all clients to the same network share. Uploads are limited to 25 MB and an extension allowlist. Existing SQLite databases in the older project `database/edupilot.db` location are copied to the new user data location on first launch, preserving their contents.
+Shared academic records are stored in PostgreSQL when configured. Private voice notes and device-local application settings are stored in SQLite. Uploaded course documents and assignment attachments are copied into the managed files folder; the database stores file keys and metadata rather than file contents. By default, the files folder is local, but `EDUPILOT_FILES_DIR` can point all clients to the same network share. Uploads are limited to 25 MB and an extension allowlist. Existing SQLite databases in the older project `database/edupilot.db` location are copied to the new user data location on first launch. This update then performs the approved one-time demo reset; see [Demo Accounts](docs/DEMO_ACCOUNTS.md) for the exact reset scope.
 
 Default data locations:
 

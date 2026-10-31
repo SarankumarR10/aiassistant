@@ -61,7 +61,7 @@ class VoiceNotesWidget(QWidget):
         ready, explanation = speech_input_status()
         self.mic_start.setEnabled(ready)
         self.dictation_status.setText(explanation)
-        self.mic_start.setToolTip(explanation if not ready else "Transcribe through your configured local Vosk model.")
+        self.mic_start.setToolTip(explanation if not ready else "Turn speech into text on this device.")
         self.mic_start.clicked.connect(self.start_dictation)
         self.mic_stop.clicked.connect(self.stop_dictation)
         mic_row = QHBoxLayout()
@@ -183,6 +183,7 @@ class VoiceNotesWidget(QWidget):
             return
         self.speech_error = ""
         self.speech_worker = SpeechInputWorker(self)
+        self.speech_worker.partial_text.connect(self._show_dictation_partial)
         self.speech_worker.phrase_recognized.connect(self._append_transcription)
         self.speech_worker.failed.connect(self._dictation_failed)
         self.speech_worker.finished.connect(self._dictation_finished)
@@ -190,6 +191,10 @@ class VoiceNotesWidget(QWidget):
         self.mic_stop.setEnabled(True)
         self.dictation_status.setText("Listening offline. Pause between phrases; transcript stays on this device.")
         self.speech_worker.start()
+
+    def _show_dictation_partial(self, phrase):
+        if phrase:
+            self.dictation_status.setText(f"Hearing: “{phrase}”… transcript is not saved until you save the note.")
 
     def _append_transcription(self, phrase):
         existing = self.content_input.toPlainText().rstrip()
